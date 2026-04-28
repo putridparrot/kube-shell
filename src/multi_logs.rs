@@ -1,10 +1,13 @@
 use regex::Regex;
+use chrono::{DateTime, Local, LocalResult, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Instant;
+
+use crate::interrupt::ForegroundCommandGuard;
 
 fn run_kubectl_capture(args: &[&str]) -> Result<String, String> {
     let output = Command::new("kubectl")
@@ -176,6 +179,10 @@ fn has_follow_flag(args: &[String]) -> bool {
     args.iter().any(|arg| arg == "-f" || arg == "--follow")
 }
 
+fn has_timestamps_flag(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "--timestamps" || arg == "--timestamps=true")
+}
+
 fn explicit_namespace(args: &[String]) -> Option<String> {
     let mut i = 0;
     while i < args.len() {
@@ -264,6 +271,13 @@ struct FilterOptions {
     exclude: Option<Matcher>,
     before: usize,
     after: usize,
+    time_range: Option<TimeRange>,
+}
+
+#[derive(Clone)]
+struct TimeRange {
+    from_utc: Option<DateTime<Utc>>,
+    to_utc: Option<DateTime<Utc>>,
 }
 
 #[derive(Default)]
@@ -278,6 +292,144 @@ fn parse_usize(value: &str, flag_name: &str) -> Result<usize, String> {
     value
         .parse::<usize>()
         .map_err(|_| format!("Invalid value for {flag_name}: {value}"))
+}
+
+fn resolve_local_datetime(value: &str, is_end: bool) -> Result<DateTime<Utc>, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("Time value cannot be empty".to_string());
+    }
+
+    if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
+        return Ok(dt.with_timezone(&Utc));
+    }
+
+    let local_dt = if let Ok(naive) = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M") {
+        naive
+    } else if let Ok(naive) = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S") {
+        naive
+    } else if let Ok(time) = NaiveTime::parse_from_str(trimmed, "%H:%M") {
+        let today = Local::now().date_naive();
+        NaiveDateTime::new(today, time)
+    } else if let Ok(time) = NaiveTime::parse_from_str(trimmed, "%H:%M:%S") {
+        let today = Local::now().date_naive();
+        NaiveDateTime::new(today, time)
+    } else if let Ok(date) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
+        let time = if is_end {
+            NaiveTime::from_hms_opt(23, 59, 59).expect("valid end-of-day time")
+        } else {
+            NaiveTime::from_hms_opt(0, 0, 0).expect("valid start-of-day time")
+        };
+        NaiveDateTime::new(date, time)
+    } else {
+        return Err(format!(
+            "Invalid time value '{trimmed}'. Use HH:MM, YYYY-MM-DD, YYYY-MM-DD HH:MM, or RFC3339"
+        ));
+    };
+
+    match Local.from_local_datetime(&local_dt) {
+        LocalResult::Single(dt) => Ok(dt.with_timezone(&Utc)),
+        LocalResult::Ambiguous(earliest, latest) => {
+            if is_end {
+                Ok(latest.with_timezone(&Utc))
+            } else {
+                Ok(earliest.with_timezone(&Utc))
+            }
+        }
+        LocalResult::None => Err(format!("Local time '{trimmed}' is not valid in this timezone")),
+    }
+}
+
+fn parse_time_range(args: &[String]) -> Result<(Option<TimeRange>, Vec<String>), String> {
+    let mut from_raw: Option<String> = None;
+    let mut to_raw: Option<String> = None;
+    let mut filtered_args: Vec<String> = Vec::new();
+
+    let mut idx = 0;
+    while idx < args.len() {
+        let arg = &args[idx];
+
+        if arg == "--from" {
+            if idx + 1 >= args.len() {
+                return Err("Usage: logs [..] --from <time> [--to <time>]".to_string());
+            }
+            from_raw = Some(args[idx + 1].clone());
+            idx += 2;
+            continue;
+        }
+
+        if arg == "--to" {
+            if idx + 1 >= args.len() {
+                return Err("Usage: logs [..] [--from <time>] --to <time>".to_string());
+            }
+            to_raw = Some(args[idx + 1].clone());
+            idx += 2;
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--from=") {
+            from_raw = Some(value.to_string());
+            idx += 1;
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--to=") {
+            to_raw = Some(value.to_string());
+            idx += 1;
+            continue;
+        }
+
+        filtered_args.push(arg.clone());
+        idx += 1;
+    }
+
+    if from_raw.is_none() && to_raw.is_none() {
+        return Ok((None, filtered_args));
+    }
+
+    let from_utc = match from_raw {
+        Some(value) => Some(resolve_local_datetime(&value, false)?),
+        None => None,
+    };
+    let to_utc = match to_raw {
+        Some(value) => Some(resolve_local_datetime(&value, true)?),
+        None => None,
+    };
+
+    if let (Some(from), Some(to)) = (from_utc.as_ref(), to_utc.as_ref())
+        && from > to
+    {
+        return Err("--from must be earlier than or equal to --to".to_string());
+    }
+
+    Ok((Some(TimeRange { from_utc, to_utc }), filtered_args))
+}
+
+fn line_timestamp_utc(line: &str) -> Option<DateTime<Utc>> {
+    let candidate = line.split_whitespace().next()?;
+    DateTime::parse_from_rfc3339(candidate)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+fn line_in_time_range(line: &str, range: &TimeRange) -> bool {
+    let Some(ts) = line_timestamp_utc(line) else {
+        return false;
+    };
+
+    if let Some(from) = range.from_utc.as_ref()
+        && ts < *from
+    {
+        return false;
+    }
+
+    if let Some(to) = range.to_utc.as_ref()
+        && ts > *to
+    {
+        return false;
+    }
+
+    true
 }
 
 fn build_matcher(pattern: &str, is_regex: bool, ignore_case: bool) -> Result<Matcher, String> {
@@ -315,11 +467,12 @@ fn parse_multi_log_options(args: &[String]) -> Result<(Vec<String>, bool, bool, 
     let mut ignore_case = false;
     let mut use_regex = false;
 
+    let (time_range, parsed_args) = parse_time_range(args)?;
     let mut base_logs_args: Vec<String> = Vec::new();
 
     let mut idx = 1;
-    while idx < args.len() {
-        let arg = &args[idx];
+    while idx < parsed_args.len() {
+        let arg = &parsed_args[idx];
 
         match arg.as_str() {
             "--multi" | "--pick" => {
@@ -345,28 +498,28 @@ fn parse_multi_log_options(args: &[String]) -> Result<(Vec<String>, bool, bool, 
                 if idx + 1 >= args.len() {
                     return Err("Usage: logs --multi|--pick --include <pattern>".to_string());
                 }
-                include_pattern = Some(args[idx + 1].clone());
+                include_pattern = Some(parsed_args[idx + 1].clone());
                 idx += 2;
             }
             "--exclude" => {
-                if idx + 1 >= args.len() {
+                if idx + 1 >= parsed_args.len() {
                     return Err("Usage: logs --multi|--pick --exclude <pattern>".to_string());
                 }
-                exclude_pattern = Some(args[idx + 1].clone());
+                exclude_pattern = Some(parsed_args[idx + 1].clone());
                 idx += 2;
             }
             "--before" => {
-                if idx + 1 >= args.len() {
+                if idx + 1 >= parsed_args.len() {
                     return Err("Usage: logs --multi|--pick --before <N>".to_string());
                 }
-                before = parse_usize(&args[idx + 1], "--before")?;
+                before = parse_usize(&parsed_args[idx + 1], "--before")?;
                 idx += 2;
             }
             "--after" => {
-                if idx + 1 >= args.len() {
+                if idx + 1 >= parsed_args.len() {
                     return Err("Usage: logs --multi|--pick --after <N>".to_string());
                 }
-                after = parse_usize(&args[idx + 1], "--after")?;
+                after = parse_usize(&parsed_args[idx + 1], "--after")?;
                 idx += 2;
             }
             _ => {
@@ -408,6 +561,7 @@ fn parse_multi_log_options(args: &[String]) -> Result<(Vec<String>, bool, bool, 
             exclude,
             before,
             after,
+            time_range,
         },
     ))
 }
@@ -421,6 +575,7 @@ fn stream_logs_for_pods(
     align_pod_column: bool,
     filters: FilterOptions,
 ) -> Result<(), String> {
+    let _guard = ForegroundCommandGuard::new();
     let (tx, rx) = mpsc::channel::<(usize, String, String)>();
 
     for (idx, pod) in pods.iter().enumerate() {
@@ -430,7 +585,10 @@ fn stream_logs_for_pods(
             args.push("-n".to_string());
             args.push(namespace.to_string());
         }
-        if !has_follow_flag(&args) {
+        if filters.time_range.is_some() && !has_timestamps_flag(&args) {
+            args.push("--timestamps=true".to_string());
+        }
+        if filters.time_range.is_none() && !has_follow_flag(&args) {
             args.push("-f".to_string());
         }
         args.push(pod.clone());
@@ -506,6 +664,12 @@ fn stream_logs_for_pods(
         let state = pod_states.entry(pod.clone()).or_default();
         state.line_no += 1;
         let current_no = state.line_no;
+
+        if let Some(range) = filters.time_range.as_ref()
+            && !line_in_time_range(&line, range)
+        {
+            continue;
+        }
 
         if filters.exclude.as_ref().is_some_and(|m| m.is_match(&line)) {
             continue;
@@ -600,4 +764,99 @@ pub fn execute_multi_logs_command(
         align_pod_column,
         filters,
     )
+}
+
+pub fn stream_logs_for_pod_list(
+    pods: &[String],
+    namespace: &str,
+    base_logs_args: &[String],
+    show_commands: bool,
+) -> Result<(), String> {
+    if pods.is_empty() {
+        return Err("No pods selected for logs".to_string());
+    }
+
+    stream_logs_for_pods(
+        pods,
+        namespace,
+        base_logs_args,
+        show_commands,
+        true,
+        true,
+        FilterOptions {
+            include: None,
+            exclude: None,
+            before: 0,
+            after: 0,
+            time_range: None,
+        },
+    )
+}
+
+pub fn stream_logs_for_pod_list_with_filters(
+    pods: &[String],
+    namespace: &str,
+    logs_args: &[String],
+    show_commands: bool,
+) -> Result<(), String> {
+    if pods.is_empty() {
+        return Err("No pods selected for logs".to_string());
+    }
+
+    let (base_logs_args, include_elapsed_ts, align_pod_column, filters) =
+        parse_multi_log_options(logs_args)?;
+
+    stream_logs_for_pods(
+        pods,
+        namespace,
+        &base_logs_args,
+        show_commands,
+        include_elapsed_ts,
+        align_pod_column,
+        filters,
+    )
+}
+
+pub fn execute_filtered_logs_command(args: &[String], show_commands: bool) -> Result<(), String> {
+    let (time_range, mut kubectl_args) = parse_time_range(args)?;
+    let Some(range) = time_range else {
+        return Err("No log time range provided".to_string());
+    };
+
+    let _guard = ForegroundCommandGuard::new();
+
+    if !has_timestamps_flag(&kubectl_args) {
+        kubectl_args.push("--timestamps=true".to_string());
+    }
+
+    if show_commands {
+        print_kubectl_command(&kubectl_args);
+    }
+
+    let mut child = Command::new("kubectl")
+        .args(kubectl_args.iter().map(String::as_str))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|err| format!("Failed to start kubectl logs: {err}"))?;
+
+    if let Some(stdout) = child.stdout.take() {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            let line = line.map_err(|err| format!("Error reading log output: {err}"))?;
+            if line_in_time_range(&line, &range) {
+                println!("{line}");
+            }
+        }
+    }
+
+    let status = child
+        .wait()
+        .map_err(|err| format!("Failed waiting for kubectl logs: {err}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("kubectl logs exited with status: {status}"))
+    }
 }

@@ -1,5 +1,7 @@
 use std::process::{Command, Stdio};
 
+use crate::interrupt::ForegroundCommandGuard;
+
 /// Run kubectl and capture output
 pub fn run_kubectl_capture(args: &[&str]) -> Result<String, String> {
     let output = Command::new("kubectl")
@@ -20,6 +22,7 @@ pub fn run_kubectl_status(args: &[&str], show_commands: bool) -> Result<(), Stri
         print_kubectl_command_refs(args);
     }
 
+    let _guard = ForegroundCommandGuard::new();
     let status = Command::new("kubectl")
         .args(args)
         .stdin(Stdio::inherit())
@@ -41,6 +44,7 @@ pub fn run_kubectl_args(args: &[String], show_commands: bool) -> Result<(), Stri
         print_kubectl_command(args);
     }
 
+    let _guard = ForegroundCommandGuard::new();
     let status = Command::new("kubectl")
         .args(args.iter().map(String::as_str))
         .stdin(Stdio::inherit())

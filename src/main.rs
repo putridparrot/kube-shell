@@ -5,6 +5,7 @@ mod completion;
 mod kubectl;
 mod config;
 mod commands;
+mod interrupt;
 
 use rustyline::error::ReadlineError;
 use rustyline::history::FileHistory;
@@ -16,28 +17,34 @@ use config::*;
 use commands::execute_kubectl_command;
 
 fn main() {
+    if let Err(err) = interrupt::install_ctrlc_handler() {
+        eprintln!("{err}");
+        return;
+    }
+
     println!("kube-shell started. Type 'exit' or 'quit' to leave.");
     println!(
-        "Built-ins: !!, help, ns, ctx, use/switch, bookmark/b, alias, view, dryrun, showcmd/trace, pick, restart, tail"
+        "Built-ins: !!, help, ns, ctx, use/switch, alias, view, dryrun, trace, restart, restart-reason, tail"
     );
 
     let config_path = resolve_config_file();
-    let bookmarks_path = bookmarks_file();
+    let aliases_path = aliases_file();
     let exec_commands = load_exec_commands(&config_path);
     let hint_color_prefix = load_hint_color_prefix(&config_path);
-    let aliases = load_aliases(&config_path);
+    let mut aliases = load_aliases(&config_path);
+    aliases.extend(load_runtime_aliases(&aliases_path));
     let dry_run = load_dry_run(&config_path);
     let show_commands = load_show_commands(&config_path);
     let safe_delete = load_safe_delete(&config_path);
     let risky_contexts = load_risky_contexts(&config_path);
     let prompt_template = load_prompt_template(&config_path);
-    let bookmarks = load_bookmarks(&bookmarks_path);
     let state_path = state_file();
     let (saved_profile, saved_dry_run, saved_show_commands, saved_prev_ctx, saved_prev_ns) =
         load_shell_state(&state_path);
 
     let mut shell_state = ShellState {
         aliases,
+        aliases_file: aliases_path,
         output_profile: saved_profile.unwrap_or(OutputProfile::Default),
         dry_run: saved_dry_run.unwrap_or(dry_run),
         show_commands: saved_show_commands.unwrap_or(show_commands),
@@ -47,8 +54,6 @@ fn main() {
         previous_namespace: saved_prev_ns,
         prompt_template,
         state_file: state_path,
-        bookmarks,
-        bookmarks_file: bookmarks_path,
     };
     let mut last_command: Option<String> = None;
 
@@ -69,7 +74,6 @@ fn main() {
         exec_commands,
         hint_color_prefix,
         shell_state.aliases.keys().cloned().collect(),
-        shell_state.bookmarks.keys().cloned().collect(),
     )));
 
     let history_file = history_file();
@@ -80,8 +84,11 @@ fn main() {
     }
 
     loop {
+        // Clear any stale foreground-interrupt marker before waiting for prompt input.
+        let _ = interrupt::consume_pending_interrupt();
+
         if let Some(helper) = rl.helper_mut() {
-            helper.set_bookmark_names(shell_state.bookmarks.keys().cloned().collect());
+            helper.set_alias_names(shell_state.aliases.keys().cloned().collect());
         }
 
         let cluster = current_context();
@@ -128,8 +135,14 @@ fn main() {
 
                 if let Err(err) = execute_kubectl_command(command.as_str(), &mut shell_state) {
                     eprintln!("{err}");
-                } else if let Err(err) = save_shell_state(&shell_state) {
-                    eprintln!("Warning: {err}");
+                } else {
+                    if let Err(err) = save_shell_state(&shell_state) {
+                        eprintln!("Warning: {err}");
+                    }
+
+                    if let Err(err) = save_runtime_aliases(&shell_state.aliases_file, &shell_state.aliases) {
+                        eprintln!("Warning: {err}");
+                    }
                 }
             }
             Err(ReadlineError::Eof) => {
@@ -137,8 +150,12 @@ fn main() {
                 break;
             }
             Err(ReadlineError::Interrupted) => {
+                if interrupt::consume_pending_interrupt() {
+                    println!();
+                    continue;
+                }
                 println!();
-                continue;
+                break;
             }
             Err(err) => {
                 eprintln!("Failed to read input: {err}");
@@ -152,6 +169,10 @@ fn main() {
     }
 
     if let Err(err) = save_shell_state(&shell_state) {
+        eprintln!("Warning: {err}");
+    }
+
+    if let Err(err) = save_runtime_aliases(&shell_state.aliases_file, &shell_state.aliases) {
         eprintln!("Warning: {err}");
     }
 

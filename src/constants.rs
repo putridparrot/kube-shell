@@ -54,6 +54,8 @@ pub const COMMON_FLAGS: &[&str] = &[
     "--all-namespaces",
     "--namespace",
     "-n",
+    "-f",
+    "--follow",
     "-o",
     "--output",
     "--selector",
@@ -68,7 +70,6 @@ pub const COMMON_FLAGS: &[&str] = &[
 pub const BUILT_INS: &[&str] = &[
     "!!",
     "trace",
-    "showcmd",
     "help",
     "ns",
     "namespace",
@@ -76,13 +77,11 @@ pub const BUILT_INS: &[&str] = &[
     "context",
     "use",
     "switch",
-    "bookmark",
-    "b",
     "alias",
     "view",
     "dryrun",
-    "pick",
     "restart",
+    "restart-reason",
     "tail",
     "exit",
     "quit",
@@ -119,8 +118,8 @@ pub const EXEC_INNER_COMMANDS: &[&str] = &[
 /// Configuration file name
 pub const CONFIG_FILE_NAME: &str = ".kube-shellrc";
 
-/// Bookmarks file name
-pub const BOOKMARKS_FILE_NAME: &str = ".kube-shell-bookmarks";
+/// Runtime aliases file name
+pub const ALIASES_FILE_NAME: &str = ".kube-shell-aliases";
 
 /// State file name
 pub const STATE_FILE_NAME: &str = ".kube-shell-state";
