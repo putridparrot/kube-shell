@@ -124,29 +124,9 @@ pub fn command_candidates_with_live(
 
     helper.refresh_cache_if_needed();
 
-    if active_cmd == "bookmark" {
-        if previous_tokens.len() == command_index + 1 {
-            options.extend(
-                ["add", "use", "list", "remove", "rm", "delete"]
-                    .into_iter()
-                    .map(str::to_string),
-            );
-            return options;
-        }
-
-        if previous_tokens.last() == Some(&"use")
-            || previous_tokens.last() == Some(&"remove")
-            || previous_tokens.last() == Some(&"rm")
-            || previous_tokens.last() == Some(&"delete")
-        {
-            options.extend(helper.bookmark_names());
-            return options;
-        }
-    }
-
     if active_cmd == "alias" {
         if previous_tokens.len() == command_index + 1 {
-            options.extend(["list", "test"].into_iter().map(str::to_string));
+            options.extend(["list", "add", "remove", "test"].into_iter().map(str::to_string));
             return options;
         }
 
@@ -161,7 +141,7 @@ pub fn command_candidates_with_live(
         return options;
     }
 
-    if active_cmd == "showcmd" || active_cmd == "trace" {
+    if active_cmd == "trace" {
         options.extend(["on", "off", "status"].into_iter().map(str::to_string));
         return options;
     }
@@ -172,37 +152,35 @@ pub fn command_candidates_with_live(
         return options;
     }
 
-    if active_cmd == "b" {
-        if previous_tokens.len() == command_index + 1 {
-            options.extend(helper.bookmark_names());
-            options.extend(
-                ["add", "use", "list", "remove", "rm", "delete"]
-                    .into_iter()
-                    .map(str::to_string),
-            );
-            return options;
-        }
-
-        if previous_tokens.last() == Some(&"use")
-            || previous_tokens.last() == Some(&"remove")
-            || previous_tokens.last() == Some(&"rm")
-            || previous_tokens.last() == Some(&"delete")
-        {
-            options.extend(helper.bookmark_names());
-            return options;
-        }
-    }
-
-    if active_cmd == "pick" {
-        options.extend(helper.with_cache(|c| c.resources.clone()));
-        return options;
-    }
-
     if active_cmd == "restart" {
         if previous_tokens.len() == command_index + 1 {
             options.extend(["deploy", "deployment", "daemonset", "statefulset"].into_iter().map(str::to_string));
             return options;
         }
+    }
+
+    if active_cmd == "restart-reason" {
+        if previous_tokens.last() == Some(&"-o") || previous_tokens.last() == Some(&"--output") {
+            options.extend(["table", "json", "markdown"].into_iter().map(str::to_string));
+            return options;
+        }
+
+        if previous_tokens.len() == command_index + 1 {
+            options.extend(
+                ["pod", "pods", "po", "deployment", "deploy", "statefulset", "sts", "daemonset", "ds", "replicaset", "rs"]
+                    .into_iter()
+                    .map(str::to_string),
+            );
+            let ns = current_namespace();
+            options.extend(helper.object_names_for("pods", Some(ns.as_str())));
+            return options;
+        }
+
+        options.extend(
+            ["--all", "--logs", "--tail", "--since", "-o", "--output", "-n", "--namespace"]
+                .into_iter()
+                .map(str::to_string),
+        );
     }
 
     if active_cmd == "tail" {
@@ -212,6 +190,14 @@ pub fn command_candidates_with_live(
             options.extend(helper.object_names_for("pods", Some(ns.as_str())));
             return options;
         }
+    }
+
+    if active_cmd == "port-forward" {
+        if previous_tokens.last() == Some(&"--browse-scheme") {
+            options.extend(["http", "https"].into_iter().map(str::to_string));
+            return options;
+        }
+        options.extend(["--browse", "--browse-scheme"].into_iter().map(str::to_string));
     }
 
     if previous_tokens.last() == Some(&"ctx")
@@ -276,6 +262,8 @@ pub fn command_candidates_with_live(
                 [
                     "--multi",
                     "--pick",
+                    "--from",
+                    "--to",
                     "--no-ts",
                     "--no-align",
                     "--include",

@@ -52,6 +52,7 @@ impl OutputProfile {
 /// Main shell state managed throughout the session
 pub struct ShellState {
     pub aliases: HashMap<String, String>,
+    pub aliases_file: PathBuf,
     pub output_profile: OutputProfile,
     pub dry_run: bool,
     pub show_commands: bool,
@@ -61,8 +62,6 @@ pub struct ShellState {
     pub previous_namespace: Option<String>,
     pub prompt_template: String,
     pub state_file: PathBuf,
-    pub bookmarks: HashMap<String, String>,
-    pub bookmarks_file: PathBuf,
 }
 
 /// Cache for completion data with TTL
@@ -82,7 +81,6 @@ pub struct KubeShellHelper {
     pub exec_commands: Vec<String>,
     pub hint_color_prefix: String,
     pub alias_names: Vec<String>,
-    pub bookmark_names: Vec<String>,
 }
 
 impl KubeShellHelper {
@@ -90,7 +88,6 @@ impl KubeShellHelper {
         exec_commands: Vec<String>,
         hint_color_prefix: String,
         alias_names: Vec<String>,
-        bookmark_names: Vec<String>,
     ) -> Self {
         Self {
             hinter: HistoryHinter::default(),
@@ -105,7 +102,6 @@ impl KubeShellHelper {
             exec_commands,
             hint_color_prefix,
             alias_names,
-            bookmark_names,
         }
     }
 
@@ -117,12 +113,8 @@ impl KubeShellHelper {
         self.alias_names.clone()
     }
 
-    pub fn bookmark_names(&self) -> Vec<String> {
-        self.bookmark_names.clone()
-    }
-
-    pub fn set_bookmark_names(&mut self, bookmark_names: Vec<String>) {
-        self.bookmark_names = bookmark_names;
+    pub fn set_alias_names(&mut self, names: Vec<String>) {
+        self.alias_names = names;
     }
 
     pub fn with_cache<T, F>(&self, f: F) -> T

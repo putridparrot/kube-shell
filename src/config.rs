@@ -49,21 +49,21 @@ pub fn home_config_file() -> PathBuf {
     PathBuf::from(CONFIG_FILE_NAME)
 }
 
-/// Get the bookmarks file path
-pub fn bookmarks_file() -> PathBuf {
+/// Get the runtime aliases file path
+pub fn aliases_file() -> PathBuf {
     if let Ok(cwd) = env::current_dir() {
-        return cwd.join(BOOKMARKS_FILE_NAME);
+        return cwd.join(ALIASES_FILE_NAME);
     }
 
     if let Ok(home) = env::var("USERPROFILE") {
-        return PathBuf::from(home).join(BOOKMARKS_FILE_NAME);
+        return PathBuf::from(home).join(ALIASES_FILE_NAME);
     }
 
     if let Ok(home) = env::var("HOME") {
-        return PathBuf::from(home).join(BOOKMARKS_FILE_NAME);
+        return PathBuf::from(home).join(ALIASES_FILE_NAME);
     }
 
-    PathBuf::from(BOOKMARKS_FILE_NAME)
+    PathBuf::from(ALIASES_FILE_NAME)
 }
 
 /// Resolve the config file (workspace or home)
@@ -296,6 +296,32 @@ pub fn load_aliases(path: &PathBuf) -> HashMap<String, String> {
     aliases
 }
 
+/// Load persisted runtime aliases from file
+pub fn load_runtime_aliases(path: &PathBuf) -> HashMap<String, String> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(_) => return HashMap::new(),
+    };
+
+    let mut aliases = HashMap::new();
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        if let Some((name, expansion)) = line.split_once('=') {
+            let name = name.trim();
+            let expansion = expansion.trim();
+            if !name.is_empty() && !expansion.is_empty() {
+                aliases.insert(name.to_string(), expansion.to_string());
+            }
+        }
+    }
+
+    aliases
+}
+
 /// Load safe delete setting from config
 pub fn load_safe_delete(path: &PathBuf) -> bool {
     let content = match fs::read_to_string(path) {
@@ -409,32 +435,6 @@ pub fn load_risky_contexts(path: &PathBuf) -> HashSet<String> {
     contexts
 }
 
-/// Load bookmarks from file
-pub fn load_bookmarks(path: &PathBuf) -> HashMap<String, String> {
-    let content = match fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(_) => return HashMap::new(),
-    };
-
-    let mut bookmarks = HashMap::new();
-    for raw in content.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        if let Some((name, target)) = line.split_once('=') {
-            let name = name.trim();
-            let target = target.trim();
-            if !name.is_empty() && !target.is_empty() && crate::commands::parse_use_target(target).is_ok() {
-                bookmarks.insert(name.to_string(), target.to_string());
-            }
-        }
-    }
-
-    bookmarks
-}
-
 /// Load hint color prefix from config
 pub fn load_hint_color_prefix(path: &PathBuf) -> String {
     let content = match fs::read_to_string(path) {
@@ -482,16 +482,17 @@ pub fn load_prompt_template(path: &PathBuf) -> String {
     DEFAULT_PROMPT_TEMPLATE.to_string()
 }
 
-/// Save bookmarks to file
-pub fn save_bookmarks(path: &PathBuf, bookmarks: &HashMap<String, String>) -> Result<(), String> {
-    let mut entries: Vec<(&String, &String)> = bookmarks.iter().collect();
+/// Save runtime aliases to file
+pub fn save_runtime_aliases(path: &PathBuf, aliases: &HashMap<String, String>) -> Result<(), String> {
+    let mut entries: Vec<(&String, &String)> = aliases.iter().collect();
     entries.sort_by(|a, b| a.0.cmp(b.0));
 
     let content = entries
         .into_iter()
-        .map(|(name, target)| format!("{name}={target}"))
+        .map(|(name, expansion)| format!("{name}={expansion}"))
         .collect::<Vec<_>>()
         .join("\n");
 
-    fs::write(path, format!("{content}\n")).map_err(|err| format!("Failed to save bookmarks: {err}"))
+    fs::write(path, format!("{content}\n"))
+        .map_err(|err| format!("Failed to save runtime aliases: {err}"))
 }

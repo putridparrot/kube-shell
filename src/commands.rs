@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::process::{Command, Stdio};
+use serde::Serialize;
 
 use crate::kubectl::*;
 use crate::types::ShellState;
-use crate::config::save_bookmarks;
+use crate::interrupt::ForegroundCommandGuard;
 
 /// Parse command line with shell-like quoting
 pub fn parse_command_line(input: &str) -> Result<Vec<String>, String> {
@@ -294,72 +295,12 @@ pub fn select_from_list(prompt: &str, items: &[String]) -> Result<Option<String>
     }
 }
 
-/// Pipe text to a command
-pub fn pipe_text_to_command(cmd: &str, args: &[&str], text: &str) -> Result<(), String> {
-    let mut child = Command::new(cmd)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|err| format!("Failed to start clipboard command '{}': {err}", cmd))?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(text.as_bytes())
-            .map_err(|err| format!("Failed to write clipboard content: {err}"))?;
-    }
-
-    let status = child
-        .wait()
-        .map_err(|err| format!("Failed to wait for clipboard command '{}': {err}", cmd))?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("Clipboard command '{}' failed", cmd))
-    }
-}
-
-/// Copy text to clipboard
-pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
-    if cfg!(target_os = "windows") {
-        return pipe_text_to_command("cmd", &["/C", "clip"], text).map_err(|err| {
-            format!(
-                "{err}. Ensure 'clip' is available in PATH (normally provided by Windows)."
-            )
-        });
-    }
-
-    if cfg!(target_os = "macos") {
-        return pipe_text_to_command("pbcopy", &[], text)
-            .map_err(|err| format!("{err}. Ensure 'pbcopy' is available on macOS."));
-    }
-
-    if pipe_text_to_command("wl-copy", &[], text).is_ok() {
-        return Ok(());
-    }
-
-    if pipe_text_to_command("xclip", &["-selection", "clipboard"], text).is_ok() {
-        return Ok(());
-    }
-
-    if pipe_text_to_command("xsel", &["--clipboard", "--input"], text).is_ok() {
-        return Ok(());
-    }
-
-    Err(
-        "No supported clipboard tool found (tried wl-copy, xclip, xsel). Install wl-clipboard or xclip/xsel."
-            .to_string(),
-    )
-}
-
 // ============================================================================
 // Built-in command handlers
 // ============================================================================
 
 /// Execute alias command
-pub fn execute_alias_command(args: &[String], state: &ShellState) -> Result<(), String> {
+pub fn execute_alias_command(args: &[String], state: &mut ShellState) -> Result<(), String> {
     if args.len() == 1 || (args.len() == 2 && args[1] == "list") {
         if state.aliases.is_empty() {
             println!("No aliases configured.");
@@ -388,7 +329,65 @@ pub fn execute_alias_command(args: &[String], state: &ShellState) -> Result<(), 
         return Ok(());
     }
 
-    Err("Usage: alias [list] | alias test <name> [args...]".to_string())
+    if args.len() >= 2 && args[1] == "remove" {
+        if args.len() != 3 {
+            return Err("Usage: alias remove <name>".to_string());
+        }
+
+        if state.aliases.remove(&args[2]).is_some() {
+            println!("Alias '{}' removed.", args[2]);
+            return Ok(());
+        }
+
+        return Err(format!("Alias '{}' not found", args[2]));
+    }
+
+    if args.len() >= 2 && args[1] == "add" {
+        if args.len() < 4 {
+            return Err("Usage: alias add <name> <expansion...>".to_string());
+        }
+
+        let name = args[2].trim().to_string();
+        let expansion = args[3..].join(" ").trim().to_string();
+
+        if name.is_empty() || expansion.is_empty() {
+            return Err("Usage: alias add <name> <expansion...>".to_string());
+        }
+
+        state.aliases.insert(name.clone(), expansion.clone());
+        println!("Alias '{}' = '{}' saved.", name, expansion);
+        return Ok(());
+    }
+
+    if args.len() >= 2 {
+        let mut split = args[1].splitn(2, '=');
+        if let (Some(name_raw), Some(first_expansion)) = (split.next(), split.next()) {
+            let name = name_raw.trim().to_string();
+            let mut expansion_parts: Vec<String> = Vec::new();
+
+            if !first_expansion.trim().is_empty() {
+                expansion_parts.push(first_expansion.trim().to_string());
+            }
+
+            if args.len() > 2 {
+                expansion_parts.extend(args[2..].iter().cloned());
+            }
+
+            let expansion = expansion_parts.join(" ").trim().to_string();
+
+            if name.is_empty() || expansion.is_empty() {
+                return Err("Usage: alias <name>=<expansion...>".to_string());
+            }
+
+            state.aliases.insert(name.clone(), expansion.clone());
+            println!("Alias '{}' = '{}' saved.", name, expansion);
+            return Ok(());
+        }
+    }
+
+    Err(
+        "Usage: alias [list] | alias <name>=<expansion...> | alias add <name> <expansion...> | alias remove <name> | alias test <name> [args...]".to_string(),
+    )
 }
 
 /// Execute dryrun command
@@ -421,8 +420,8 @@ pub fn execute_dryrun_command(args: &[String], state: &mut ShellState) -> Result
     }
 }
 
-/// Execute showcmd command
-pub fn execute_showcmd_command(args: &[String], state: &mut ShellState) -> Result<(), String> {
+/// Execute trace command
+pub fn execute_trace_command(args: &[String], state: &mut ShellState) -> Result<(), String> {
     if args.len() == 1 || (args.len() == 2 && args[1] == "status") {
         println!(
             "Command display: {}",
@@ -432,7 +431,7 @@ pub fn execute_showcmd_command(args: &[String], state: &mut ShellState) -> Resul
     }
 
     if args.len() != 2 {
-        return Err("Usage: showcmd [on|off|status]".to_string());
+        return Err("Usage: trace [on|off|status]".to_string());
     }
 
     match args[1].as_str() {
@@ -453,7 +452,7 @@ pub fn execute_showcmd_command(args: &[String], state: &mut ShellState) -> Resul
             );
             Ok(())
         }
-        _ => Err("Usage: showcmd [on|off|status]".to_string()),
+        _ => Err("Usage: trace [on|off|status]".to_string()),
     }
 }
 
@@ -466,14 +465,16 @@ pub fn execute_help_command(args: &[String]) -> Result<(), String> {
         println!("  ns <namespace>|-            Switch namespace or previous namespace");
         println!("  ctx <context>|-             Switch context or previous context");
         println!("  use <ctx>/<ns>              Switch context/namespace in one command");
-        println!("  bookmark|b ...              Manage/use bookmarks");
+        println!("  alias <name>=<expansion>    Add/update an alias");
+        println!("  alias add <name> <exp...>   Add/update an alias");
+        println!("  alias remove <name>         Remove an alias");
         println!("  alias [list|test]           Inspect and test aliases");
         println!("  view [profile]              Set output profile for get commands");
         println!("  dryrun [on|off|status]      Toggle automatic dry-run mode");
-        println!("  showcmd [on|off|status]     Show full kubectl command before execution");
-        println!("  trace [on|off|status]       Alias for showcmd");
-        println!("  pick ...                    Select resource names (supports --run/--copy)");
+        println!("  trace [on|off|status]       Show full kubectl command before execution");
         println!("  restart ...                 Rollout restart + status helper");
+        println!("  restart-reason ...          Show probable pod restart causes");
+        println!("  port-forward ... --browse   Open browser for forwarded localhost port");
         println!("  tail ...                    Follow pod/deployment logs");
         println!("  logs --multi|--pick         Multi-pod fuzzy log streaming with per-pod colors");
         println!("  exit, quit                  Leave kube-shell");
@@ -485,24 +486,16 @@ pub fn execute_help_command(args: &[String]) -> Result<(), String> {
     }
 
     match args[1].as_str() {
-        "pick" => {
-            println!("pick usage:");
-            println!("  pick <resource> [namespace] [--run <template>] [--copy]");
-            println!("  template placeholders: {{1}}/{{name}}, {{ns}}");
-        }
         "alias" => {
             println!("alias usage:");
             println!("  alias list");
+            println!("  alias <name>=<expansion>");
+            println!("  alias add <name> <expansion...>");
+            println!("  alias remove <name>");
             println!("  alias test <name> [args...]");
+            println!("  aliases are persisted in .kube-shell-aliases");
+            println!("  alias ops=use prod-cluster/kube-system");
             println!("  config placeholders: {{1}}, {{2}}, ..., {{all}}");
-        }
-        "bookmark" | "b" => {
-            println!("bookmark usage:");
-            println!("  bookmark add <name> <ctx>/<ns>");
-            println!("  bookmark use <name>");
-            println!("  bookmark list");
-            println!("  bookmark remove <name>");
-            println!("  b <name> is shorthand for bookmark use <name>");
         }
         "dryrun" => {
             println!("dryrun usage:");
@@ -513,15 +506,35 @@ pub fn execute_help_command(args: &[String]) -> Result<(), String> {
             println!("  logs --multi");
             println!("  logs --pick");
             println!("  optional flags still apply, e.g. -n/--namespace, -c/--container, --tail=100");
+            println!("  time range flags: --from <time>, --to <time> (disables follow)");
+            println!("  time formats: HH:MM, YYYY-MM-DD, YYYY-MM-DD HH:MM, RFC3339");
             println!("  formatting flags: --no-ts, --no-align");
             println!("  filtering flags: --include <pattern>, --exclude <pattern>");
             println!("  context flags: --before <N>, --after <N>");
             println!("  matching flags: --ignore-case, --regex");
         }
-        "showcmd" | "trace" => {
-            println!("showcmd usage:");
-            println!("  showcmd [on|off|status]");
+        "restart-reason" => {
+            println!("restart-reason usage:");
+            println!("  restart-reason <pod-name>");
+            println!("  restart-reason pod/<name>");
+            println!("  restart-reason <resource>/<name>");
+            println!("  restart-reason <resource> <name>");
+            println!("  options: -n|--namespace <ns>, --all");
+            println!("           --logs [--tail N] [--since DURATION]");
+            println!("           -o|--output table|json|markdown");
+            println!("  resources: deployment, statefulset, daemonset, replicaset, pod");
+            println!("  notes: exit code hints include common causes such as OOMKill (137)");
+        }
+        "trace" => {
             println!("  trace [on|off|status]");
+        }
+        "port-forward" => {
+            println!("port-forward helper option:");
+            println!("  port-forward <target> <local:remote> --browse");
+            println!("  port-forward <target> <local:remote> --browse-scheme https");
+            println!("  kubectl port-forward <target> <local:remote> --browse");
+            println!("  --browse-scheme accepts http|https (defaults to http)");
+            println!("  opens <scheme>://localhost:<localPort>");
         }
         _ => {
             println!("No detailed help for '{}'. Try 'help' for command list.", args[1]);
@@ -630,179 +643,6 @@ pub fn execute_view_command(args: &[String], state: &mut ShellState) -> Result<(
     Ok(())
 }
 
-// Bookmark and picker commands are in their own section below...
-/// Execute bookmark command
-pub fn execute_bookmark_command(args: &[String], state: &mut ShellState) -> Result<(), String> {
-    if args.len() < 2 {
-        return Err("Usage: bookmark <add|use|list|remove> ...".to_string());
-    }
-
-    match args[1].as_str() {
-        "list" => {
-            if state.bookmarks.is_empty() {
-                println!("No bookmarks defined.");
-                return Ok(());
-            }
-
-            let mut items: Vec<(&String, &String)> = state.bookmarks.iter().collect();
-            items.sort_by(|a, b| a.0.cmp(b.0));
-            for (name, target) in items {
-                println!("{name} -> {target}");
-            }
-            Ok(())
-        }
-        "add" => {
-            if args.len() < 4 {
-                return Err(
-                    "Usage: bookmark add <name> <context>/<namespace>|<context>|/<namespace>|<context> <namespace>"
-                        .to_string(),
-                );
-            }
-
-            let name = args[2].trim();
-            if name.is_empty() {
-                return Err("Bookmark name cannot be empty".to_string());
-            }
-
-            let target = if args.len() == 4 {
-                args[3].trim().to_string()
-            } else if args.len() == 5 {
-                format!("{}/{}", args[3].trim(), args[4].trim())
-            } else {
-                return Err(
-                    "Usage: bookmark add <name> <context>/<namespace>|<context>|/<namespace>|<context> <namespace>"
-                        .to_string(),
-                );
-            };
-
-            parse_use_target(&target)?;
-            state.bookmarks.insert(name.to_string(), target.clone());
-            save_bookmarks(&state.bookmarks_file, &state.bookmarks)?;
-            println!("Bookmark '{name}' saved as {target}");
-            Ok(())
-        }
-        "use" => {
-            if args.len() != 3 {
-                return Err("Usage: bookmark use <name>".to_string());
-            }
-
-            let Some(target) = state.bookmarks.get(&args[2]).cloned() else {
-                return Err(format!("Bookmark '{}' not found", args[2]));
-            };
-
-            execute_use_command_with_state(&["use".to_string(), target.clone()], state)?;
-            println!("Applied bookmark '{}' ({target})", args[2]);
-            Ok(())
-        }
-        "remove" | "rm" | "delete" => {
-            if args.len() != 3 {
-                return Err("Usage: bookmark remove <name>".to_string());
-            }
-
-            if state.bookmarks.remove(&args[2]).is_some() {
-                save_bookmarks(&state.bookmarks_file, &state.bookmarks)?;
-                println!("Removed bookmark '{}'", args[2]);
-            } else {
-                return Err(format!("Bookmark '{}' not found", args[2]));
-            }
-            Ok(())
-        }
-        _ => Err("Usage: bookmark <add|use|list|remove> ...".to_string()),
-    }
-}
-
-/// Execute bookmark shortcut (b command)
-pub fn execute_bookmark_shortcut(args: &[String], state: &mut ShellState) -> Result<(), String> {
-    if args.len() < 2 {
-        return Err("Usage: b <bookmark-name> | b <add|use|list|remove> ...".to_string());
-    }
-
-    let bookmark_subcommands = ["add", "use", "list", "remove", "rm", "delete"];
-    let mapped: Vec<String> = if bookmark_subcommands.contains(&args[1].as_str()) {
-        let mut v = vec!["bookmark".to_string()];
-        v.extend(args.iter().skip(1).cloned());
-        v
-    } else {
-        if args.len() != 2 {
-            return Err("Usage: b <bookmark-name> | b <add|use|list|remove> ...".to_string());
-        }
-        vec!["bookmark".to_string(), "use".to_string(), args[1].clone()]
-    };
-
-    execute_bookmark_command(&mapped, state)
-}
-
-/// Execute pick command
-pub fn execute_pick_command_with_state(args: &[String], state: &mut ShellState) -> Result<(), String> {
-    if args.len() < 2 {
-        return Err("Usage: pick <resource> [namespace] [--run <template>] [--copy]".to_string());
-    }
-
-    let resource = args[1].as_str();
-    let mut namespace_arg: Option<&str> = None;
-    let mut run_template: Option<&str> = None;
-    let mut copy_selected = false;
-
-    let mut idx = 2;
-    while idx < args.len() {
-        if args[idx] == "--run" {
-            if idx + 1 >= args.len() {
-                return Err("Usage: pick <resource> [namespace] [--run <template>] [--copy]".to_string());
-            }
-            run_template = Some(args[idx + 1].as_str());
-            idx += 2;
-            continue;
-        }
-
-        if args[idx] == "--copy" {
-            copy_selected = true;
-            idx += 1;
-            continue;
-        }
-
-        if namespace_arg.is_none() {
-            namespace_arg = Some(args[idx].as_str());
-            idx += 1;
-            continue;
-        }
-
-        return Err("Usage: pick <resource> [namespace] [--run <template>] [--copy]".to_string());
-    }
-
-    let fallback_namespace = if namespace_arg.is_some() {
-        None
-    } else {
-        Some(current_namespace())
-    };
-    let namespace = namespace_arg.or_else(|| fallback_namespace.as_deref());
-
-    let items = kubectl_object_names(resource, namespace);
-    if items.is_empty() {
-        println!("No {} found.", resource);
-        return Ok(());
-    }
-
-    if let Some(selected) = select_from_list("Pick", &items)? {
-        if copy_selected {
-            copy_to_clipboard(&selected)?;
-            println!("Copied '{}' to clipboard", selected);
-        }
-
-        if let Some(template) = run_template {
-            let ns_value = namespace.unwrap_or("");
-            let command = template
-                .replace("{1}", &selected)
-                .replace("{name}", &selected)
-                .replace("{ns}", ns_value);
-            execute_kubectl_command(&command, state)?;
-        } else if !copy_selected {
-            println!("{}", selected);
-        }
-    }
-
-    Ok(())
-}
-
 /// Execute restart command
 pub fn execute_restart_command(args: &[String], state: &ShellState) -> Result<(), String> {
     if args.len() < 2 || args.len() > 3 {
@@ -861,6 +701,435 @@ pub fn pods_for_selector(namespace: &str, selector: &str) -> Vec<String> {
     kubectl_lines(&refs)
 }
 
+fn resolve_pod_name(namespace: &str, input: &str) -> Result<String, String> {
+    if input.is_empty() {
+        return Err("Pod name cannot be empty".to_string());
+    }
+
+    let pods = kubectl_object_names("pods", Some(namespace));
+    if pods.is_empty() {
+        return Err(format!("No pods found in namespace '{}'", namespace));
+    }
+
+    if let Some(exact) = pods.iter().find(|pod| pod.as_str() == input) {
+        return Ok(exact.clone());
+    }
+
+    let input_lower = input.to_ascii_lowercase();
+    let matches: Vec<String> = pods
+        .into_iter()
+        .filter(|pod| pod.to_ascii_lowercase().contains(&input_lower))
+        .collect();
+
+    match matches.len() {
+        0 => Err(format!(
+            "No pods matched '{}' in namespace '{}'",
+            input, namespace
+        )),
+        1 => Ok(matches[0].clone()),
+        _ => select_from_list(
+            &format!("Multiple pods matched '{}', select pod", input),
+            &matches,
+        )?
+        .ok_or_else(|| "Tail cancelled".to_string()),
+    }
+}
+
+fn split_pipeline(args: &[String]) -> Result<Vec<Vec<String>>, String> {
+    let mut stages: Vec<Vec<String>> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+
+    for token in args {
+        if token == "|" {
+            if current.is_empty() {
+                return Err("Missing command between pipe operators".to_string());
+            }
+            stages.push(current);
+            current = Vec::new();
+        } else {
+            current.push(token.clone());
+        }
+    }
+
+    if current.is_empty() {
+        return Err("Pipe command is missing after '|'".to_string());
+    }
+
+    stages.push(current);
+    Ok(stages)
+}
+
+fn run_command_pipeline(stages: &[Vec<String>], show_commands: bool) -> Result<(), String> {
+    if stages.is_empty() {
+        return Err("No command to execute".to_string());
+    }
+
+    if stages.iter().any(|stage| stage.is_empty()) {
+        return Err("Invalid empty command in pipeline".to_string());
+    }
+
+    if show_commands {
+        let rendered = stages
+            .iter()
+            .map(|stage| {
+                stage
+                    .iter()
+                    .map(|arg| format!("{:?}", arg))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        println!("+ {rendered}");
+    }
+
+    let mut children: Vec<std::process::Child> = Vec::new();
+    let mut previous_stdout: Option<std::process::ChildStdout> = None;
+
+    let _guard = ForegroundCommandGuard::new();
+
+
+    for (idx, stage) in stages.iter().enumerate() {
+        let mut command = Command::new(&stage[0]);
+        command.args(stage[1..].iter().map(String::as_str));
+        command.stderr(Stdio::inherit());
+
+        if idx == 0 {
+            command.stdin(Stdio::inherit());
+        } else {
+            let stdin = previous_stdout
+                .take()
+                .ok_or_else(|| "Failed to connect pipeline stdin".to_string())?;
+            command.stdin(Stdio::from(stdin));
+        }
+
+        if idx + 1 < stages.len() {
+            command.stdout(Stdio::piped());
+        } else {
+            command.stdout(Stdio::inherit());
+        }
+
+        let mut child = command
+            .spawn()
+            .map_err(|err| format!("Failed to execute command '{}': {err}", stage[0]))?;
+
+        if idx + 1 < stages.len() {
+            previous_stdout = child.stdout.take();
+        }
+
+        children.push(child);
+    }
+
+    let mut statuses = Vec::with_capacity(children.len());
+    for mut child in children {
+        statuses.push(
+            child
+                .wait()
+                .map_err(|err| format!("Failed waiting for command: {err}"))?,
+        );
+    }
+
+    for (idx, status) in statuses.iter().enumerate() {
+        if !status.success() {
+            return Err(format!(
+                "Command '{}' exited with status: {}",
+                stages[idx][0], status
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn execute_prefixed_kubectl_command(args: &[String], show_commands: bool) -> Result<(), String> {
+    if args.is_empty() {
+        return Err("Usage: kubectl <args...>".to_string());
+    }
+
+    let stages = split_pipeline(args)?;
+
+    if stages.len() == 1
+        && stages[0]
+            .first()
+            .is_some_and(|cmd| cmd == "port-forward")
+    {
+        return execute_port_forward_with_optional_browse(&stages[0], show_commands);
+    }
+
+    let mut pipeline: Vec<Vec<String>> = Vec::with_capacity(stages.len());
+
+    let mut first = vec!["kubectl".to_string()];
+    first.extend(stages[0].clone());
+    pipeline.push(first);
+
+    for stage in stages.into_iter().skip(1) {
+        pipeline.push(stage);
+    }
+
+    run_command_pipeline(&pipeline, show_commands)
+}
+
+fn port_forward_flag_takes_value(flag: &str) -> bool {
+    matches!(
+        flag,
+        "-n"
+            | "--namespace"
+            | "--context"
+            | "--kubeconfig"
+            | "--address"
+            | "--pod-running-timeout"
+    )
+}
+
+fn normalize_browse_scheme(value: &str) -> Result<String, String> {
+    match value {
+        "http" | "https" => Ok(value.to_string()),
+        _ => Err("--browse-scheme must be 'http' or 'https'".to_string()),
+    }
+}
+
+fn strip_browse_flag(args: &[String]) -> Result<(Vec<String>, bool, String), String> {
+    let mut stripped: Vec<String> = Vec::with_capacity(args.len());
+    let mut browse = false;
+    let mut scheme = "http".to_string();
+    let mut idx = 0;
+
+    while idx < args.len() {
+        let arg = args[idx].as_str();
+
+        if arg == "--browse" {
+            browse = true;
+            idx += 1;
+            continue;
+        }
+
+        if arg == "--browse-scheme" {
+            if idx + 1 >= args.len() {
+                return Err("--browse-scheme requires a value: http or https".to_string());
+            }
+
+            scheme = normalize_browse_scheme(&args[idx + 1])?;
+            browse = true;
+            idx += 2;
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--browse-scheme=") {
+            scheme = normalize_browse_scheme(value)?;
+            browse = true;
+            idx += 1;
+            continue;
+        }
+
+        stripped.push(args[idx].clone());
+        idx += 1;
+    }
+
+    Ok((stripped, browse, scheme))
+}
+
+fn port_forward_local_port(args: &[String]) -> Option<u16> {
+    if args.first().map(String::as_str) != Some("port-forward") {
+        return None;
+    }
+
+    let mut i = 1;
+    let mut skip_next = false;
+    let mut positional_count = 0;
+
+    while i < args.len() {
+        let token = args[i].as_str();
+
+        if skip_next {
+            skip_next = false;
+            i += 1;
+            continue;
+        }
+
+        if token.starts_with('-') {
+            if port_forward_flag_takes_value(token) {
+                skip_next = true;
+            }
+            i += 1;
+            continue;
+        }
+
+        positional_count += 1;
+        if positional_count == 2 {
+            let local = token.split(':').next().unwrap_or(token).trim();
+            return local.parse::<u16>().ok();
+        }
+
+        i += 1;
+    }
+
+    None
+}
+
+fn execute_port_forward_with_optional_browse(args: &[String], show_commands: bool) -> Result<(), String> {
+    let (sanitized_args, browse, scheme) = strip_browse_flag(args)?;
+
+    if !browse {
+        return run_kubectl_args(&sanitized_args, show_commands);
+    }
+
+    let Some(port) = port_forward_local_port(&sanitized_args) else {
+        return Err(
+            "--browse requires an explicit local port mapping, e.g. port-forward svc/api 8080:80 --browse"
+                .to_string(),
+        );
+    };
+
+    if show_commands {
+        print_kubectl_command(&sanitized_args);
+    }
+
+    let _guard = ForegroundCommandGuard::new();
+    let mut child = Command::new("kubectl")
+        .args(sanitized_args.iter().map(String::as_str))
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|err| format!("Failed to execute kubectl: {err}"))?;
+
+    let url = format!("{scheme}://localhost:{port}");
+    match webbrowser::open(&url) {
+        Ok(_) => println!("Opened {url}"),
+        Err(err) => eprintln!("Unable to open browser for {url}: {err}"),
+    }
+
+    let status = child
+        .wait()
+        .map_err(|err| format!("Failed waiting for kubectl: {err}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("kubectl exited with status: {status}"))
+    }
+}
+
+fn logs_flag_takes_value(flag: &str) -> bool {
+    matches!(
+        flag,
+        "-n"
+            | "--namespace"
+            | "-c"
+            | "--container"
+            | "--context"
+            | "--kubeconfig"
+            | "--since"
+            | "--since-time"
+            | "--tail"
+            | "--limit-bytes"
+            | "--max-log-requests"
+            | "-l"
+            | "--selector"
+    )
+}
+
+fn explicit_namespace_from_args(args: &[String]) -> Option<String> {
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "-n" || args[i] == "--namespace" {
+            if i + 1 < args.len() {
+                return Some(args[i + 1].clone());
+            }
+            return None;
+        }
+
+        if let Some(ns) = args[i].strip_prefix("--namespace=")
+            && !ns.is_empty()
+        {
+            return Some(ns.to_string());
+        }
+
+        if let Some(ns) = args[i].strip_prefix("-n=")
+            && !ns.is_empty()
+        {
+            return Some(ns.to_string());
+        }
+
+        i += 1;
+    }
+
+    None
+}
+
+fn first_logs_target_index(args: &[String]) -> Option<usize> {
+    let mut i = 1;
+    let mut skip_next = false;
+
+    while i < args.len() {
+        let token = args[i].as_str();
+
+        if token == "--" {
+            return if i + 1 < args.len() { Some(i + 1) } else { None };
+        }
+
+        if skip_next {
+            skip_next = false;
+            i += 1;
+            continue;
+        }
+
+        if logs_flag_takes_value(token) {
+            skip_next = true;
+            i += 1;
+            continue;
+        }
+
+        if token.starts_with('-') {
+            i += 1;
+            continue;
+        }
+
+        return Some(i);
+    }
+
+    None
+}
+
+fn matching_pods_for_input(namespace: &str, input: &str) -> Result<Vec<String>, String> {
+    if input.is_empty() {
+        return Err("Pod name cannot be empty".to_string());
+    }
+
+    let pods = kubectl_object_names("pods", Some(namespace));
+    if pods.is_empty() {
+        return Err(format!("No pods found in namespace '{}'", namespace));
+    }
+
+    let input_lower = input.to_ascii_lowercase();
+    let matches: Vec<String> = pods
+        .into_iter()
+        .filter(|pod| pod.to_ascii_lowercase().contains(&input_lower))
+        .collect();
+
+    if matches.is_empty() {
+        Err(format!(
+            "No pods matched '{}' in namespace '{}'",
+            input, namespace
+        ))
+    } else {
+        Ok(matches)
+    }
+}
+
+fn logs_has_time_range(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        arg == "--from"
+            || arg == "--to"
+            || arg.starts_with("--from=")
+            || arg.starts_with("--to=")
+    })
+}
+
+fn logs_has_follow(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "-f" || arg == "--follow")
+}
+
 /// Execute tail command to follow logs
 pub fn execute_tail_command(args: &[String], state: &ShellState) -> Result<(), String> {
     if args.len() < 2 || args.len() > 3 {
@@ -870,7 +1139,7 @@ pub fn execute_tail_command(args: &[String], state: &ShellState) -> Result<(), S
     let namespace = current_namespace();
 
     let pod = if args.len() == 2 {
-        args[1].clone()
+        resolve_pod_name(&namespace, &args[1])?
     } else if matches!(args[1].as_str(), "deploy" | "deployment" | "deployments") {
         let selector = deployment_selector(&args[2], &namespace)?;
         let pods = pods_for_selector(&namespace, &selector);
@@ -899,18 +1168,517 @@ pub fn execute_tail_command(args: &[String], state: &ShellState) -> Result<(), S
     ], state.show_commands)
 }
 
+#[derive(Debug)]
+struct RestartReasonRow {
+    container: String,
+    restart_count: u32,
+    current_reason: Option<String>,
+    last_reason: Option<String>,
+    last_exit_code: Option<i32>,
+    last_finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartReasonOutput {
+    Table,
+    Json,
+    Markdown,
+}
+
+#[derive(Debug)]
+struct RestartReasonArgs {
+    namespace: String,
+    positional: Vec<String>,
+    show_all: bool,
+    include_logs: bool,
+    tail: Option<u32>,
+    since: Option<String>,
+    output: RestartReasonOutput,
+}
+
+#[derive(Debug, Serialize)]
+struct RestartReasonItem {
+    container: String,
+    restart_count: u32,
+    current_reason: Option<String>,
+    last_reason: Option<String>,
+    last_exit_code: Option<i32>,
+    last_exit_hint: Option<String>,
+    last_finished_at: Option<String>,
+    logs: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RestartReasonReport {
+    namespace: String,
+    pod: String,
+    items: Vec<RestartReasonItem>,
+}
+
+fn is_pod_resource(resource: &str) -> bool {
+    matches!(resource, "pod" | "pods" | "po")
+}
+
+fn workload_selector(resource: &str, name: &str, namespace: &str) -> Result<String, String> {
+    run_kubectl_capture(&[
+        "get",
+        resource,
+        name,
+        "-n",
+        namespace,
+        "-o",
+        "jsonpath={range $k,$v := .spec.selector.matchLabels}{$k}={$v},{end}",
+    ])
+    .map(|value| value.trim_end_matches(',').to_string())
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn usage_restart_reason() -> &'static str {
+    "Usage: restart-reason <pod|pod/name|resource/name|resource name> [-n namespace] [--all] [--logs] [--tail N] [--since DURATION] [--output table|json|markdown]"
+}
+
+fn parse_restart_reason_output(value: &str) -> Result<RestartReasonOutput, String> {
+    match value {
+        "table" => Ok(RestartReasonOutput::Table),
+        "json" => Ok(RestartReasonOutput::Json),
+        "markdown" | "md" => Ok(RestartReasonOutput::Markdown),
+        _ => Err(format!(
+            "Invalid output '{value}'. Expected one of: table, json, markdown"
+        )),
+    }
+}
+
+fn parse_u32_flag(name: &str, value: &str) -> Result<u32, String> {
+    value
+        .parse::<u32>()
+        .map_err(|_| format!("{name} requires an integer value"))
+}
+
+fn exit_code_hint(code: i32) -> Option<&'static str> {
+    match code {
+        0 => Some("clean exit"),
+        1 => Some("general error"),
+        126 => Some("command invoked cannot execute"),
+        127 => Some("command not found"),
+        128 => Some("invalid exit argument"),
+        130 => Some("terminated by SIGINT (Ctrl+C)"),
+        137 => Some("terminated by SIGKILL (often OOMKill)") ,
+        139 => Some("segmentation fault (SIGSEGV)"),
+        143 => Some("terminated by SIGTERM"),
+        _ => None,
+    }
+}
+
+fn restart_row_has_evidence(row: &RestartReasonRow, show_all: bool) -> bool {
+    show_all || row.restart_count > 0 || row.current_reason.is_some() || row.last_reason.is_some()
+}
+
+fn row_item_with_logs(
+    namespace: &str,
+    pod: &str,
+    row: &RestartReasonRow,
+    include_logs: bool,
+    tail: Option<u32>,
+    since: Option<&str>,
+) -> RestartReasonItem {
+    let logs = if include_logs {
+        Some(fetch_container_logs(
+            namespace,
+            pod,
+            row.container.strip_prefix("init:").unwrap_or(row.container.as_str()),
+            tail.unwrap_or(50),
+            since,
+        ))
+    } else {
+        None
+    };
+
+    RestartReasonItem {
+        container: row.container.clone(),
+        restart_count: row.restart_count,
+        current_reason: row.current_reason.clone(),
+        last_reason: row.last_reason.clone(),
+        last_exit_code: row.last_exit_code,
+        last_exit_hint: row
+            .last_exit_code
+            .and_then(exit_code_hint)
+            .map(str::to_string),
+        last_finished_at: row.last_finished_at.clone(),
+        logs,
+    }
+}
+
+fn fetch_container_logs(
+    namespace: &str,
+    pod: &str,
+    container: &str,
+    tail: u32,
+    since: Option<&str>,
+) -> String {
+    let mut args: Vec<String> = vec![
+        "logs".to_string(),
+        pod.to_string(),
+        "-n".to_string(),
+        namespace.to_string(),
+        "-c".to_string(),
+        container.to_string(),
+        "--tail".to_string(),
+        tail.to_string(),
+    ];
+
+    if let Some(value) = since {
+        args.push("--since".to_string());
+        args.push(value.to_string());
+    }
+
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_kubectl_capture(&refs).unwrap_or_else(|err| format!("<unable to fetch logs: {err}>"))
+}
+
+fn print_restart_reason_table(reports: &[RestartReasonReport]) {
+    for report in reports {
+        println!("Pod: {} (namespace: {})", report.pod, report.namespace);
+        if report.items.is_empty() {
+            println!("  No restart evidence found.");
+            println!();
+            continue;
+        }
+
+        println!("  {0:<28} {1:<8} {2:<24} {3:<20} {4:<9} {5}", "container", "restarts", "current", "last", "exit", "finished");
+        println!("  {0:-<28} {1:-<8} {2:-<24} {3:-<20} {4:-<9} {5:-<20}", "", "", "", "", "", "");
+
+        for item in &report.items {
+            let exit_display = match (item.last_exit_code, item.last_exit_hint.as_deref()) {
+                (Some(code), Some(hint)) => format!("{code} ({hint})"),
+                (Some(code), None) => code.to_string(),
+                _ => "".to_string(),
+            };
+
+            println!(
+                "  {0:<28} {1:<8} {2:<24} {3:<20} {4:<9} {5}",
+                item.container,
+                item.restart_count,
+                item.current_reason.as_deref().unwrap_or(""),
+                item.last_reason.as_deref().unwrap_or(""),
+                exit_display,
+                item.last_finished_at.as_deref().unwrap_or(""),
+            );
+
+            if let Some(logs) = item.logs.as_deref() {
+                println!("    logs:");
+                for line in logs.lines() {
+                    println!("      {line}");
+                }
+            }
+        }
+        println!();
+    }
+}
+
+fn print_restart_reason_markdown(reports: &[RestartReasonReport]) {
+    for report in reports {
+        println!("## Pod `{}` (namespace `{}`)", report.pod, report.namespace);
+        if report.items.is_empty() {
+            println!();
+            println!("No restart evidence found.");
+            println!();
+            continue;
+        }
+
+        println!();
+        println!("| Container | Restarts | Current Reason | Last Reason | Last Exit | Finished At |");
+        println!("|---|---:|---|---|---|---|");
+
+        for item in &report.items {
+            let exit_display = match (item.last_exit_code, item.last_exit_hint.as_deref()) {
+                (Some(code), Some(hint)) => format!("{} ({})", code, hint),
+                (Some(code), None) => code.to_string(),
+                _ => "".to_string(),
+            };
+
+            println!(
+                "| {} | {} | {} | {} | {} | {} |",
+                item.container.replace('|', "\\|"),
+                item.restart_count,
+                item.current_reason.as_deref().unwrap_or("").replace('|', "\\|"),
+                item.last_reason.as_deref().unwrap_or("").replace('|', "\\|"),
+                exit_display.replace('|', "\\|"),
+                item.last_finished_at.as_deref().unwrap_or("").replace('|', "\\|"),
+            );
+
+            if let Some(logs) = item.logs.as_deref() {
+                println!();
+                println!("Logs for `{}`:", item.container);
+                println!("```text");
+                println!("{}", logs);
+                println!("```");
+            }
+        }
+
+        println!();
+    }
+}
+
+fn pod_restart_rows(namespace: &str, pod: &str) -> Result<Vec<RestartReasonRow>, String> {
+    let output = run_kubectl_capture(&[
+        "get",
+        "pod",
+        pod,
+        "-n",
+        namespace,
+        "-o",
+        "jsonpath={range .status.initContainerStatuses[*]}init:{.name}{'\t'}{.restartCount}{'\t'}{.state.waiting.reason}{'\t'}{.state.terminated.reason}{'\t'}{.lastState.terminated.reason}{'\t'}{.lastState.terminated.exitCode}{'\t'}{.lastState.terminated.finishedAt}{'\n'}{end}{range .status.containerStatuses[*]}{.name}{'\t'}{.restartCount}{'\t'}{.state.waiting.reason}{'\t'}{.state.terminated.reason}{'\t'}{.lastState.terminated.reason}{'\t'}{.lastState.terminated.exitCode}{'\t'}{.lastState.terminated.finishedAt}{'\n'}{end}",
+    ])?;
+
+    let mut rows = Vec::new();
+    for line in output.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let mut cols = line.split('\t').map(str::trim).collect::<Vec<_>>();
+        while cols.len() < 7 {
+            cols.push("");
+        }
+
+        rows.push(RestartReasonRow {
+            container: cols[0].to_string(),
+            restart_count: cols[1].parse::<u32>().unwrap_or(0),
+            current_reason: non_empty(cols[2]).or_else(|| non_empty(cols[3])),
+            last_reason: non_empty(cols[4]),
+            last_exit_code: non_empty(cols[5]).and_then(|v| v.parse::<i32>().ok()),
+            last_finished_at: non_empty(cols[6]),
+        });
+    }
+
+    Ok(rows)
+}
+
+fn parse_restart_reason_args(args: &[String]) -> Result<RestartReasonArgs, String> {
+    if args.len() < 2 {
+        return Err(usage_restart_reason().to_string());
+    }
+
+    let mut namespace = current_namespace();
+    let mut show_all = false;
+    let mut include_logs = false;
+    let mut tail: Option<u32> = None;
+    let mut since: Option<String> = None;
+    let mut output = RestartReasonOutput::Table;
+    let mut positional: Vec<String> = Vec::new();
+
+    let mut idx = 1;
+    while idx < args.len() {
+        let arg = args[idx].as_str();
+
+        if arg == "--all" {
+            show_all = true;
+            idx += 1;
+            continue;
+        }
+
+        if arg == "--logs" {
+            include_logs = true;
+            idx += 1;
+            continue;
+        }
+
+        if arg == "-n" || arg == "--namespace" {
+            if idx + 1 >= args.len() {
+                return Err(usage_restart_reason().to_string());
+            }
+            namespace = args[idx + 1].clone();
+            idx += 2;
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--namespace=") {
+            if value.is_empty() {
+                return Err(usage_restart_reason().to_string());
+            }
+            namespace = value.to_string();
+            idx += 1;
+            continue;
+        }
+
+        if arg == "--tail" {
+            if idx + 1 >= args.len() {
+                return Err(usage_restart_reason().to_string());
+            }
+            tail = Some(parse_u32_flag("--tail", &args[idx + 1])?);
+            include_logs = true;
+            idx += 2;
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--tail=") {
+            tail = Some(parse_u32_flag("--tail", value)?);
+            include_logs = true;
+            idx += 1;
+            continue;
+        }
+
+        if arg == "--since" {
+            if idx + 1 >= args.len() {
+                return Err(usage_restart_reason().to_string());
+            }
+            since = Some(args[idx + 1].clone());
+            include_logs = true;
+            idx += 2;
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--since=") {
+            if value.is_empty() {
+                return Err(usage_restart_reason().to_string());
+            }
+            since = Some(value.to_string());
+            include_logs = true;
+            idx += 1;
+            continue;
+        }
+
+        if arg == "-o" || arg == "--output" {
+            if idx + 1 >= args.len() {
+                return Err(usage_restart_reason().to_string());
+            }
+            output = parse_restart_reason_output(&args[idx + 1])?;
+            idx += 2;
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--output=") {
+            output = parse_restart_reason_output(value)?;
+            idx += 1;
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("-o=") {
+            output = parse_restart_reason_output(value)?;
+            idx += 1;
+            continue;
+        }
+
+        if arg.starts_with('-') {
+            return Err(format!("Unknown option for restart-reason: {arg}"));
+        }
+
+        positional.push(args[idx].clone());
+        idx += 1;
+    }
+
+    if positional.is_empty() || positional.len() > 2 {
+        return Err(usage_restart_reason().to_string());
+    }
+
+    Ok(RestartReasonArgs {
+        namespace,
+        positional,
+        show_all,
+        include_logs,
+        tail,
+        since,
+        output,
+    })
+}
+
+fn restart_reason_target_pods(namespace: &str, positional: &[String]) -> Result<Vec<String>, String> {
+    if positional.len() == 2 {
+        let resource = positional[0].as_str();
+        let name = positional[1].as_str();
+
+        if is_pod_resource(resource) {
+            return Ok(vec![resolve_pod_name(namespace, name)?]);
+        }
+
+        let selector = workload_selector(resource, name, namespace)?;
+        let pods = pods_for_selector(namespace, &selector);
+        if pods.is_empty() {
+            return Err(format!(
+                "No pods found for {resource}/{name} in namespace '{namespace}'"
+            ));
+        }
+        return Ok(pods);
+    }
+
+    let target = positional[0].as_str();
+    if let Some((resource, name)) = target.split_once('/') {
+        if is_pod_resource(resource) {
+            return Ok(vec![resolve_pod_name(namespace, name)?]);
+        }
+
+        let selector = workload_selector(resource, name, namespace)?;
+        let pods = pods_for_selector(namespace, &selector);
+        if pods.is_empty() {
+            return Err(format!(
+                "No pods found for {resource}/{name} in namespace '{namespace}'"
+            ));
+        }
+        return Ok(pods);
+    }
+
+    matching_pods_for_input(namespace, target)
+}
+
+pub fn execute_restart_reason_command(args: &[String]) -> Result<(), String> {
+    let parsed = parse_restart_reason_args(args)?;
+    let pods = restart_reason_target_pods(&parsed.namespace, &parsed.positional)?;
+
+    let mut reports: Vec<RestartReasonReport> = Vec::new();
+    for pod in pods {
+        let rows = pod_restart_rows(&parsed.namespace, &pod)?;
+        let items: Vec<RestartReasonItem> = rows
+            .iter()
+            .filter(|row| restart_row_has_evidence(row, parsed.show_all))
+            .map(|row| {
+                row_item_with_logs(
+                    &parsed.namespace,
+                    &pod,
+                    row,
+                    parsed.include_logs,
+                    parsed.tail,
+                    parsed.since.as_deref(),
+                )
+            })
+            .collect();
+
+        reports.push(RestartReasonReport {
+            namespace: parsed.namespace.clone(),
+            pod,
+            items,
+        });
+    }
+
+    match parsed.output {
+        RestartReasonOutput::Table => print_restart_reason_table(&reports),
+        RestartReasonOutput::Markdown => print_restart_reason_markdown(&reports),
+        RestartReasonOutput::Json => {
+            let json = serde_json::to_string_pretty(&reports)
+                .map_err(|err| format!("Failed to render JSON output: {err}"))?;
+            println!("{json}");
+        }
+    }
+
+    Ok(())
+}
+
 /// Main command execution router
 pub fn execute_kubectl_command(input: &str, state: &mut ShellState) -> Result<(), String> {
     let mut args = parse_command_line(input)?;
-    args = expand_aliases(args, &state.aliases)?;
 
     if args.is_empty() {
         return Ok(());
     }
 
     if args[0] == "kubectl" {
-        args.remove(0);
+        return execute_prefixed_kubectl_command(&args[1..], state.show_commands);
     }
+
+    args = expand_aliases(args, &state.aliases)?;
 
     if args.is_empty() {
         return Ok(());
@@ -967,32 +1735,108 @@ pub fn execute_kubectl_command(input: &str, state: &mut ShellState) -> Result<()
         return execute_dryrun_command(&args, state);
     }
 
-    if args[0] == "showcmd" || args[0] == "trace" {
-        return execute_showcmd_command(&args, state);
-    }
-
-    if args[0] == "bookmark" {
-        return execute_bookmark_command(&args, state);
-    }
-
-    if args[0] == "b" {
-        return execute_bookmark_shortcut(&args, state);
-    }
-
-    if args[0] == "pick" {
-        return execute_pick_command_with_state(&args, state);
+    if args[0] == "trace" {
+        return execute_trace_command(&args, state);
     }
 
     if args[0] == "restart" {
         return execute_restart_command(&args, state);
     }
 
+    if args[0] == "restart-reason" {
+        return execute_restart_reason_command(&args);
+    }
+
     if args[0] == "tail" {
         return execute_tail_command(&args, state);
     }
 
+    if args.iter().any(|arg| arg == "|") {
+        let mut stages = split_pipeline(&args)?;
+        let mut kubectl_args = stages.remove(0);
+
+        let context = current_context();
+        if state.risky_contexts.contains(&context)
+            && should_confirm_in_risky_context(&kubectl_args)
+            && !kubectl_args.iter().any(|arg| arg == "--yes")
+            && !confirm_risky_context(&kubectl_args, &context)?
+        {
+            println!("Command cancelled.");
+            return Ok(());
+        }
+
+        apply_output_profile(&mut kubectl_args, state.output_profile);
+        apply_dry_run(&mut kubectl_args, state.dry_run);
+
+        if state.safe_delete
+            && kubectl_args.first().map(String::as_str) == Some("delete")
+            && !kubectl_args.iter().any(|arg| arg == "--yes")
+            && !confirm_delete(&kubectl_args)?
+        {
+            println!("Delete cancelled.");
+            return Ok(());
+        }
+
+        let mut pipeline: Vec<Vec<String>> = Vec::with_capacity(stages.len() + 1);
+        let mut first_stage = vec!["kubectl".to_string()];
+        first_stage.extend(kubectl_args);
+        pipeline.push(first_stage);
+        pipeline.extend(stages);
+
+        return run_command_pipeline(&pipeline, state.show_commands);
+    }
+
     if args[0] == "logs" && args.iter().any(|arg| arg == "--multi" || arg == "--pick") {
+        if logs_has_time_range(&args) && logs_has_follow(&args) {
+            return Err("logs time ranges cannot be used with -f/--follow".to_string());
+        }
         return crate::multi_logs::execute_multi_logs_command(&args, state.show_commands, current_namespace());
+    }
+
+    if args[0] == "logs" {
+        let time_ranged = logs_has_time_range(&args);
+
+        if time_ranged && logs_has_follow(&args) {
+            return Err("logs time ranges cannot be used with -f/--follow".to_string());
+        }
+
+        let Some(target_idx) = first_logs_target_index(&args) else {
+            if time_ranged {
+                return crate::multi_logs::execute_filtered_logs_command(&args, state.show_commands);
+            }
+            return run_kubectl_args(&args, state.show_commands);
+        };
+
+        let target = args[target_idx].clone();
+        if !target.contains('/') {
+            let namespace = explicit_namespace_from_args(&args).unwrap_or_else(current_namespace);
+            let matches = matching_pods_for_input(&namespace, &target)?;
+
+            if matches.len() == 1 {
+                args[target_idx] = matches[0].clone();
+            } else {
+                let mut logs_args = args.clone();
+                logs_args.remove(target_idx);
+                if time_ranged {
+                    return crate::multi_logs::stream_logs_for_pod_list_with_filters(
+                        &matches,
+                        &namespace,
+                        &logs_args,
+                        state.show_commands,
+                    );
+                }
+                return crate::multi_logs::stream_logs_for_pod_list(
+                    &matches,
+                    &namespace,
+                    &logs_args,
+                    state.show_commands,
+                );
+            }
+        }
+
+        if time_ranged {
+            return crate::multi_logs::execute_filtered_logs_command(&args, state.show_commands);
+        }
     }
 
     // Handle kubectl commands
@@ -1016,6 +1860,10 @@ pub fn execute_kubectl_command(input: &str, state: &mut ShellState) -> Result<()
     {
         println!("Delete cancelled.");
         return Ok(());
+    }
+
+    if args.first().map(String::as_str) == Some("port-forward") {
+        return execute_port_forward_with_optional_browse(&args, state.show_commands);
     }
 
     run_kubectl_args(&args, state.show_commands)
