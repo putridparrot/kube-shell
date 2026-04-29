@@ -403,6 +403,34 @@ pub fn load_show_commands(path: &PathBuf) -> bool {
     false
 }
 
+/// Load session namespace mode setting from config
+/// When true, `ns` and `use .../<ns>` update only this kube-shell session.
+pub fn load_session_namespace_mode(path: &PathBuf) -> bool {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(_) => return false,
+    };
+
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("session_namespace_mode=") {
+            let value = value.trim().to_ascii_lowercase();
+            if matches!(value.as_str(), "true" | "1" | "on" | "yes") {
+                return true;
+            }
+            if matches!(value.as_str(), "false" | "0" | "off" | "no") {
+                return false;
+            }
+        }
+    }
+
+    false
+}
+
 /// Load risky contexts from config
 pub fn load_risky_contexts(path: &PathBuf) -> HashSet<String> {
     let content = match fs::read_to_string(path) {
@@ -495,4 +523,113 @@ pub fn save_runtime_aliases(path: &PathBuf, aliases: &HashMap<String, String>) -
 
     fs::write(path, format!("{content}\n"))
         .map_err(|err| format!("Failed to save runtime aliases: {err}"))
+}
+
+/// Load AI URL from config (default: http://localhost:11434)
+pub fn load_ai_url(path: &PathBuf) -> String {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(_) => return "http://localhost:11434".to_string(),
+    };
+
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("ai_url=") {
+            let value = value.trim();
+            if !value.is_empty() {
+                return value.to_string();
+            }
+        }
+    }
+
+    "http://localhost:11434".to_string()
+}
+
+/// Load AI model from config (default: llama3.2)
+pub fn load_ai_model(path: &PathBuf) -> String {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(_) => return "llama3.2".to_string(),
+    };
+
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("ai_model=") {
+            let value = value.trim();
+            if !value.is_empty() {
+                return value.to_string();
+            }
+        }
+    }
+
+    "llama3.2".to_string()
+}
+
+fn decode_escaped_config_value(value: &str) -> String {
+    value
+        .replace("\\n", "\n")
+        .replace("\\t", "\t")
+        .replace("\\r", "\r")
+}
+
+/// Load AI ask prompt template from config.
+/// Placeholders: {question}, {context}, {namespace}
+pub fn load_ai_ask_prompt_template(path: &PathBuf) -> String {
+    const DEFAULT: &str = "You are a Kubernetes expert assistant. Current kubectl context: {context}. Current namespace: {namespace}. Answer the following question clearly and concisely. Use plain text without markdown formatting.\n\nQuestion:\n{question}";
+
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(_) => return DEFAULT.to_string(),
+    };
+
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("ai_ask_prompt_template=") {
+            let value = value.trim();
+            if !value.is_empty() {
+                return decode_escaped_config_value(value);
+            }
+        }
+    }
+
+    DEFAULT.to_string()
+}
+
+/// Load AI explain prompt template from config.
+/// Placeholders: {output}, {command}, {context}, {namespace}
+pub fn load_ai_explain_prompt_template(path: &PathBuf) -> String {
+    const DEFAULT: &str = "You are a Kubernetes expert. Current kubectl context: {context}. Current namespace: {namespace}. Explain the following kubectl output clearly and concisely, highlighting anything notable. Use plain text without markdown formatting.\n\nCommand:\n{command}\n\nOutput:\n{output}";
+
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(_) => return DEFAULT.to_string(),
+    };
+
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("ai_explain_prompt_template=") {
+            let value = value.trim();
+            if !value.is_empty() {
+                return decode_escaped_config_value(value);
+            }
+        }
+    }
+
+    DEFAULT.to_string()
 }

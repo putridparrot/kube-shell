@@ -29,6 +29,7 @@ The prompt shows your current cluster and namespace in this format:
 - Built-in rollout restart helper, restart reason diagnostics, and smart log tailing.
 - Multi-pod fuzzy log streaming with per-pod colors.
 - Timestamped and aligned multi-pod log output.
+- Background job management: run long-lived commands in the background and bring them to the foreground on demand.
 - Configurable command aliases.
 - Parameterized alias shortcuts (macros).
 - Optional safe-delete confirmation.
@@ -130,6 +131,11 @@ Example:
 Switch back to previous namespace:
 
     ns -
+
+Notes:
+- By default, this updates the current kubeconfig namespace (shared across terminals that use the same kubeconfig).
+- Set `session_namespace_mode=true` in `.kube-shellrc` to keep namespace changes local to each kube-shell process.
+- In session mode, kube-shell auto-applies `-n <session-namespace>` when you omit namespace flags (unless `-A/--all-namespaces` is used).
 
 ### Context switching
 
@@ -306,6 +312,171 @@ Follow logs quickly:
 
 If a deployment has multiple pods, kube-shell asks you to pick one.
 
+### Background Jobs
+
+Append `&` to any command to run it in the background. The shell stays responsive while the command continues running.
+
+Start a background job:
+
+    port-forward svc/my-service 8080:80 &
+    logs -f my-pod &
+    logs -f deploy/api --tail=100 &
+
+List all background jobs:
+
+    jobs
+
+Example output:
+
+    [1] running  port-forward svc/my-service 8080:80
+    [2] done     logs -f my-pod
+
+Bring a job to the foreground (streams buffered and live output):
+
+    fg 1
+
+Press **Ctrl+C** while in foreground mode to return to the shell prompt — the job keeps running in the background.
+
+Kill a background job:
+
+    job kill 1
+
+Remove finished jobs from the list:
+
+    job clean
+
+Notes:
+- When a background job finishes, kube-shell prints `[N] Done: <command>` the next time you press Enter.
+- Buffered output is kept in memory; use `fg` to replay it at any time while the job entry exists.
+- `job kill` terminates the underlying kubectl process.
+- On Windows, Ctrl+C in foreground mode may also reach the background process due to console signal propagation; use `fg` and `job kill` if a job stops unexpectedly.
+
+### AI Integration
+
+kube-shell includes optional AI-powered assistance for Kubernetes using Ollama. Ask questions about Kubernetes, explain kubectl output, and get intelligent insights—all integrated into your shell.
+
+#### Setup Requirements
+
+- **Ollama** running locally or on a network
+- **Default**: http://localhost:11434 (configurable)
+- **Models tested**: llama3.2 (default), llama2, mistral, and other Ollama-compatible models
+
+#### Install and run Ollama
+
+1. Install Ollama from [ollama.ai](https://ollama.ai).
+2. Start the Ollama server:
+
+    ollama serve
+
+   Notes:
+   - On Windows/macOS, Ollama may auto-start as a background service after install.
+   - If the service is already running, `ollama serve` may report that the port is in use.
+3. Pull at least one model (in a second terminal):
+
+    ollama pull llama3.2
+
+4. Quick health check:
+
+    ollama list
+
+   You should see your pulled model in the list.
+5. Optional API check (default endpoint):
+
+    curl http://localhost:11434/api/tags
+
+   If `curl` is unavailable on your system, skip this and use `ai status` in kube-shell.
+6. Run kube-shell and verify AI connectivity:
+
+    cargo run
+
+    ai status
+
+7. (Optional) Set custom Ollama URL/model in `.kube-shellrc` if you are not using defaults.
+
+Example `.kube-shellrc` entries:
+
+    ai_base_url=http://localhost:11434
+    ai_model=llama3.2
+
+#### AI Commands
+
+**Ask a Kubernetes question:**
+
+    ask <question>
+
+Examples:
+
+    ask what are the best practices for resource requests and limits
+    ask how do I debug a CrashLoopBackOff pod
+    ask explain the difference between a Deployment and a StatefulSet
+
+**Check AI configuration and connectivity:**
+
+    ai status
+
+Shows the configured Ollama URL, active model, and connection status.
+
+**Switch the active model at runtime:**
+
+    ai model <name>
+
+Examples:
+
+    ai model llama2
+    ai model mistral
+
+**Run kubectl and explain the output:**
+
+    ai explain <kubectl args>
+
+Examples:
+
+    ai explain get pods
+    ai explain describe pod my-pod
+    ai explain logs my-pod
+
+**Pipe kubectl output through AI for explanation:**
+
+    <kubectl command> | explain
+
+Examples:
+
+    get pods | explain
+    describe node my-node | explain
+    get events -A | explain
+
+Notes:
+- AI commands do not require kubectl syntax changes—kube-shell prepends kubectl automatically for `ai explain` and `| explain`.
+- AI prompts include your current context/namespace for better cluster-aware explanations.
+- If Ollama is unavailable, commands fail gracefully with a descriptive error message.
+- AI features are optional; the shell continues to work normally without Ollama.
+
+#### Custom AI prompt templates
+
+You can override the default AI prompts in `.kube-shellrc`:
+
+    ai_ask_prompt_template=You are a Kubernetes SRE assistant for {context}/{namespace}. Answer briefly.\n\nQuestion:\n{question}
+    ai_explain_prompt_template=You are reviewing kubectl output for {context}/{namespace}. Explain key issues first.\n\nCommand:\n{command}\n\nOutput:\n{output}
+
+Supported placeholders:
+- Ask template: `{question}`, `{context}`, `{namespace}`
+- Explain template: `{output}`, `{command}`, `{context}`, `{namespace}`
+
+Notes:
+- Template values are single-line config entries; use escaped newlines (`\\n`) for multi-line prompts.
+- If you omit placeholders, the model may lose important context.
+- Use `help ai` inside kube-shell for a quick reminder.
+
+#### Using kube-shell with MCP/agent workflows
+
+`ask` and `explain` are designed for fast local analysis of command output. For deeper multi-step investigations, pair kube-shell with a separate MCP/agent toolchain:
+
+1. Run targeted kubectl commands in kube-shell (`describe`, `events`, `logs`, etc.).
+2. Use `| explain` for immediate interpretation.
+3. If needed, hand the collected outputs to your MCP-capable agent for cross-command reasoning and automated runbooks.
+
+This hybrid approach keeps kube-shell simple and fast, while still letting advanced agents handle orchestration-heavy diagnostics.
+
 ### Port-forward browser helper
 
 `kube-shell` adds an optional `--browse` flag for `port-forward` commands.
@@ -408,6 +579,11 @@ Supported keys:
     exec_inner_command=<command>
     exec_inner_commands=cmd1,cmd2,cmd3
     hint_color=<ansi-code-or-name>
+    ai_url=<ollama-url>
+    ai_model=<model-name>
+    session_namespace_mode=<true|false>
+    ai_ask_prompt_template=<template>
+    ai_explain_prompt_template=<template>
     alias <name>=<expansion>
     alias.<name>=<expansion>
     dry_run=<true|false>
@@ -432,6 +608,22 @@ Example:
 
     # named value aliases
     # hint_color=light-gray
+
+    # AI/Ollama configuration
+    # defaults: http://localhost:11434 and llama3.2
+    ai_url=http://localhost:11434
+    ai_model=llama3.2
+
+    # optional: keep namespace changes local to each kube-shell session
+    # default is false (shared kubeconfig behavior)
+    session_namespace_mode=false
+
+    # optional prompt customization
+    # placeholders:
+    # ask: {question}, {context}, {namespace}
+    # explain: {output}, {command}, {context}, {namespace}
+    ai_ask_prompt_template=You are a Kubernetes expert for {context}/{namespace}.\n\nQuestion:\n{question}
+    ai_explain_prompt_template=Explain this kubectl output for {context}/{namespace}.\n\nCommand:\n{command}\n\nOutput:\n{output}
 
     # aliases
     alias gp=get pods
@@ -461,6 +653,20 @@ Notes:
 - hint_color supports:
     - ANSI code fragments, e.g. 90 or 38;5;245
     - Named aliases: light-gray, light_grey, lightgray, gray, grey
+- ai_url: Ollama server endpoint (default: http://localhost:11434)
+  - Supports local and remote Ollama instances, e.g. http://192.168.1.100:11434
+- ai_model: Ollama model to use (default: llama3.2)
+  - Must be available in Ollama (run `ollama pull <model>` to download)
+  - Change at runtime with `ai model <name>`
+- session_namespace_mode: Keep namespace changes local to one kube-shell process (default: false)
+    - When true, `ns`/`use .../<ns>` no longer run `kubectl config set-context --current --namespace ...`
+    - kube-shell injects `-n <namespace>` automatically when no namespace/all-namespaces flag is present
+- ai_ask_prompt_template: Custom ask prompt template
+    - Placeholders: `{question}`, `{context}`, `{namespace}`
+    - Use `\\n` for line breaks
+- ai_explain_prompt_template: Custom explain prompt template
+    - Placeholders: `{output}`, `{command}`, `{context}`, `{namespace}`
+    - Use `\\n` for line breaks
 - alias supports either:
     - alias <name>=<expansion>
     - alias.<name>=<expansion>

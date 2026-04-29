@@ -1,0 +1,5 @@
+output_profile=default
+dry_run=false
+show_commands=true
+previous_context=
+previous_namespace=
