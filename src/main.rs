@@ -6,12 +6,15 @@ mod kubectl;
 mod config;
 mod commands;
 mod interrupt;
+mod jobs;
+mod ai;
 
 use rustyline::error::ReadlineError;
 use rustyline::history::FileHistory;
 use rustyline::{Config, Editor};
 
 use types::{KubeShellHelper, ShellState, OutputProfile};
+use jobs::JobManager;
 use kubectl::current_context;
 use config::*;
 use commands::execute_kubectl_command;
@@ -24,7 +27,7 @@ fn main() {
 
     println!("kube-shell started. Type 'exit' or 'quit' to leave.");
     println!(
-        "Built-ins: !!, help, ns, ctx, use/switch, alias, view, dryrun, trace, restart, restart-reason, tail"
+        "Built-ins: !!, help, ns, ctx, use/switch, alias, view, dryrun, trace, restart, restart-reason, tail, jobs, fg, ask, ai"
     );
 
     let config_path = resolve_config_file();
@@ -35,9 +38,14 @@ fn main() {
     aliases.extend(load_runtime_aliases(&aliases_path));
     let dry_run = load_dry_run(&config_path);
     let show_commands = load_show_commands(&config_path);
+    let session_namespace_mode = load_session_namespace_mode(&config_path);
     let safe_delete = load_safe_delete(&config_path);
     let risky_contexts = load_risky_contexts(&config_path);
     let prompt_template = load_prompt_template(&config_path);
+    let ai_url = load_ai_url(&config_path);
+    let ai_model = load_ai_model(&config_path);
+    let ai_ask_prompt_template = load_ai_ask_prompt_template(&config_path);
+    let ai_explain_prompt_template = load_ai_explain_prompt_template(&config_path);
     let state_path = state_file();
     let (saved_profile, saved_dry_run, saved_show_commands, saved_prev_ctx, saved_prev_ns) =
         load_shell_state(&state_path);
@@ -48,12 +56,25 @@ fn main() {
         output_profile: saved_profile.unwrap_or(OutputProfile::Default),
         dry_run: saved_dry_run.unwrap_or(dry_run),
         show_commands: saved_show_commands.unwrap_or(show_commands),
+        session_namespace_mode,
+        session_namespace: if session_namespace_mode {
+            Some(kubectl::current_namespace())
+        } else {
+            None
+        },
         safe_delete,
         risky_contexts,
         previous_context: saved_prev_ctx,
         previous_namespace: saved_prev_ns,
         prompt_template,
         state_file: state_path,
+        job_manager: JobManager::new(),
+        ai_client: ai::AiClient::new(
+            ai_url,
+            ai_model,
+            ai_ask_prompt_template,
+            ai_explain_prompt_template,
+        ),
     };
     let mut last_command: Option<String> = None;
 
@@ -87,12 +108,15 @@ fn main() {
         // Clear any stale foreground-interrupt marker before waiting for prompt input.
         let _ = interrupt::consume_pending_interrupt();
 
+        // Notify user of any background jobs that finished since the last prompt.
+        shell_state.job_manager.notify_finished();
+
         if let Some(helper) = rl.helper_mut() {
             helper.set_alias_names(shell_state.aliases.keys().cloned().collect());
         }
 
         let cluster = current_context();
-        let namespace = kubectl::current_namespace();
+        let namespace = commands::effective_namespace(&shell_state);
         let risk_marker = if shell_state.risky_contexts.contains(&cluster) {
             "[RISK] "
         } else {

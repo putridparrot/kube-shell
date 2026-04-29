@@ -83,6 +83,8 @@ pub const BUILT_INS: &[&str] = &[
     "restart",
     "restart-reason",
     "tail",
+    "ask",
+    "ai",
     "exit",
     "quit",
 ];

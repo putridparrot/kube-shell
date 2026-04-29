@@ -189,14 +189,76 @@ pub fn switch_context_with_history(target: &str, state: &mut ShellState) -> Resu
 
 /// Switch to a namespace with history
 pub fn switch_namespace_with_history(target: &str, state: &mut ShellState) -> Result<(), String> {
-    let current = current_namespace();
+    let current = effective_namespace(state);
     if current == target {
         return Ok(());
     }
 
-    set_namespace(target, state.show_commands)?;
+    if state.session_namespace_mode {
+        state.session_namespace = Some(target.to_string());
+    } else {
+        set_namespace(target, state.show_commands)?;
+    }
     state.previous_namespace = Some(current);
     Ok(())
+}
+
+/// Resolve the namespace this shell should use for commands and prompt.
+pub fn effective_namespace(state: &ShellState) -> String {
+    if state.session_namespace_mode {
+        state
+            .session_namespace
+            .clone()
+            .unwrap_or_else(current_namespace)
+    } else {
+        current_namespace()
+    }
+}
+
+fn has_all_namespaces_flag(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| arg == "-A" || arg == "--all-namespaces")
+}
+
+fn command_supports_default_namespace(command: &str) -> bool {
+    matches!(
+        command,
+        "get"
+            | "describe"
+            | "logs"
+            | "exec"
+            | "edit"
+            | "delete"
+            | "apply"
+            | "create"
+            | "replace"
+            | "patch"
+            | "rollout"
+            | "scale"
+            | "annotate"
+            | "label"
+            | "wait"
+            | "top"
+            | "port-forward"
+    )
+}
+
+fn apply_default_namespace(args: &mut Vec<String>, state: &ShellState) {
+    if !state.session_namespace_mode || args.is_empty() {
+        return;
+    }
+
+    if explicit_namespace_from_args(args).is_some() || has_all_namespaces_flag(args) {
+        return;
+    }
+
+    if !command_supports_default_namespace(args[0].as_str()) {
+        return;
+    }
+
+    let namespace = effective_namespace(state);
+    args.push("-n".to_string());
+    args.push(namespace);
 }
 
 /// Should confirm in risky context
@@ -465,6 +527,7 @@ pub fn execute_help_command(args: &[String]) -> Result<(), String> {
         println!("  ns <namespace>|-            Switch namespace or previous namespace");
         println!("  ctx <context>|-             Switch context or previous context");
         println!("  use <ctx>/<ns>              Switch context/namespace in one command");
+        println!("  session_namespace_mode=true Keep ns changes local to this shell session");
         println!("  alias <name>=<expansion>    Add/update an alias");
         println!("  alias add <name> <exp...>   Add/update an alias");
         println!("  alias remove <name>         Remove an alias");
@@ -477,6 +540,17 @@ pub fn execute_help_command(args: &[String]) -> Result<(), String> {
         println!("  port-forward ... --browse   Open browser for forwarded localhost port");
         println!("  tail ...                    Follow pod/deployment logs");
         println!("  logs --multi|--pick         Multi-pod fuzzy log streaming with per-pod colors");
+        println!("  jobs                        List background jobs");
+        println!("  fg <id>                     Bring background job to foreground");
+        println!("  job kill <id>               Kill a background job");
+        println!("  job clean                   Remove finished jobs from list");
+        println!("  <command> &                 Run any kubectl command in the background");
+        println!("  ask <question>              Ask the AI a Kubernetes question");
+        println!("  ai status                   Show AI configuration and connectivity");
+        println!("  ai model <name>             Switch the active AI model at runtime");
+        println!("  help ai                     Show AI prompt/template customization help");
+        println!("  ai explain <args...>        Run kubectl <args> and explain the output");
+        println!("  <kubectl cmd> | explain     Pipe kubectl output through AI for explanation");
         println!("  exit, quit                  Leave kube-shell");
         return Ok(());
     }
@@ -535,6 +609,34 @@ pub fn execute_help_command(args: &[String]) -> Result<(), String> {
             println!("  kubectl port-forward <target> <local:remote> --browse");
             println!("  --browse-scheme accepts http|https (defaults to http)");
             println!("  opens <scheme>://localhost:<localPort>");
+            println!("  Tip: append & to run in the background:");
+            println!("    port-forward svc/my-service 8080:80 &");
+        }
+        "jobs" => {
+            println!("Background job management:");
+            println!("  jobs              List all background jobs");
+            println!("  fg <id>           Stream output of job <id>; Ctrl+C returns to shell");
+            println!("  job kill <id>     Terminate job <id>");
+            println!("  job clean         Remove finished jobs from the list");
+            println!("  <command> &       Run any kubectl command in the background");
+        }
+        "ai" => {
+            println!("AI usage:");
+            println!("  ask <question>");
+            println!("  ai status");
+            println!("  ai model <name>");
+            println!("  ai explain <kubectl args...>");
+            println!("  <kubectl cmd> | explain");
+            println!("Config keys in .kube-shellrc:");
+            println!("  ai_url=<ollama-url>");
+            println!("  ai_model=<model-name>");
+            println!("  ai_ask_prompt_template=<single-line template>");
+            println!("  ai_explain_prompt_template=<single-line template>");
+            println!("  session_namespace_mode=<true|false>");
+            println!("Template placeholders:");
+            println!("  ask: {{question}}, {{context}}, {{namespace}}");
+            println!("  explain: {{output}}, {{command}}, {{context}}, {{namespace}}");
+            println!("Use escaped newlines for readability, e.g. \\n in config values.");
         }
         _ => {
             println!("No detailed help for '{}'. Try 'help' for command list.", args[1]);
@@ -757,6 +859,75 @@ fn split_pipeline(args: &[String]) -> Result<Vec<Vec<String>>, String> {
 
     stages.push(current);
     Ok(stages)
+}
+
+fn run_pipeline_capture(stages: &[Vec<String>], show_commands: bool) -> Result<String, String> {
+    if stages.is_empty() {
+        return Err("No command to execute".to_string());
+    }
+
+    if stages.iter().any(|s| s.is_empty()) {
+        return Err("Invalid empty command in pipeline".to_string());
+    }
+
+    if show_commands {
+        let rendered = stages
+            .iter()
+            .map(|s| {
+                s.iter()
+                    .map(|a| format!("{:?}", a))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        println!("+ {rendered}");
+    }
+
+    let _guard = ForegroundCommandGuard::new();
+
+    let mut previous_stdout: Option<std::process::ChildStdout> = None;
+    let mut all_children: Vec<std::process::Child> = Vec::new();
+
+    for (idx, stage) in stages.iter().enumerate() {
+        let mut command = Command::new(&stage[0]);
+        command.args(stage[1..].iter().map(String::as_str));
+        command.stderr(Stdio::inherit());
+
+        if idx == 0 {
+            command.stdin(Stdio::inherit());
+        } else {
+            let stdin = previous_stdout
+                .take()
+                .ok_or_else(|| "Failed to connect pipeline stdin".to_string())?;
+            command.stdin(Stdio::from(stdin));
+        }
+
+        command.stdout(Stdio::piped());
+
+        let mut child = command
+            .spawn()
+            .map_err(|err| format!("Failed to spawn '{}': {err}", stage[0]))?;
+        previous_stdout = child.stdout.take();
+        all_children.push(child);
+    }
+
+    let last_stdout = previous_stdout
+        .ok_or_else(|| "No output stream available".to_string())?;
+
+    use std::io::Read;
+    let mut output = String::new();
+    std::io::BufReader::new(last_stdout)
+        .read_to_string(&mut output)
+        .map_err(|e| format!("Failed to read command output: {e}"))?;
+
+    for mut child in all_children {
+        child
+            .wait()
+            .map_err(|e| format!("Failed waiting for command: {e}"))?;
+    }
+
+    Ok(output)
 }
 
 fn run_command_pipeline(stages: &[Vec<String>], show_commands: bool) -> Result<(), String> {
@@ -1136,7 +1307,7 @@ pub fn execute_tail_command(args: &[String], state: &ShellState) -> Result<(), S
         return Err("Usage: tail <pod> | tail deploy <name>".to_string());
     }
 
-    let namespace = current_namespace();
+    let namespace = effective_namespace(state);
 
     let pod = if args.len() == 2 {
         resolve_pod_name(&namespace, &args[1])?
@@ -1458,12 +1629,12 @@ fn pod_restart_rows(namespace: &str, pod: &str) -> Result<Vec<RestartReasonRow>,
     Ok(rows)
 }
 
-fn parse_restart_reason_args(args: &[String]) -> Result<RestartReasonArgs, String> {
+fn parse_restart_reason_args(args: &[String], default_namespace: &str) -> Result<RestartReasonArgs, String> {
     if args.len() < 2 {
         return Err(usage_restart_reason().to_string());
     }
 
-    let mut namespace = current_namespace();
+    let mut namespace = default_namespace.to_string();
     let mut show_all = false;
     let mut include_logs = false;
     let mut tail: Option<u32> = None;
@@ -1624,8 +1795,8 @@ fn restart_reason_target_pods(namespace: &str, positional: &[String]) -> Result<
     matching_pods_for_input(namespace, target)
 }
 
-pub fn execute_restart_reason_command(args: &[String]) -> Result<(), String> {
-    let parsed = parse_restart_reason_args(args)?;
+pub fn execute_restart_reason_command(args: &[String], state: &ShellState) -> Result<(), String> {
+    let parsed = parse_restart_reason_args(args, &effective_namespace(state))?;
     let pods = restart_reason_target_pods(&parsed.namespace, &parsed.positional)?;
 
     let mut reports: Vec<RestartReasonReport> = Vec::new();
@@ -1668,13 +1839,24 @@ pub fn execute_restart_reason_command(args: &[String]) -> Result<(), String> {
 
 /// Main command execution router
 pub fn execute_kubectl_command(input: &str, state: &mut ShellState) -> Result<(), String> {
-    let mut args = parse_command_line(input)?;
+    // Detect trailing `&` — run the command in the background.
+    let trimmed = input.trim_end();
+    let (run_bg, clean_input) = if trimmed.ends_with('&') {
+        (true, trimmed.trim_end_matches('&').trim_end())
+    } else {
+        (false, input)
+    };
+
+    let mut args = parse_command_line(clean_input)?;
 
     if args.is_empty() {
         return Ok(());
     }
 
     if args[0] == "kubectl" {
+        if run_bg {
+            return state.job_manager.spawn(&args[1..], state.show_commands).map(|_| ());
+        }
         return execute_prefixed_kubectl_command(&args[1..], state.show_commands);
     }
 
@@ -1744,15 +1926,147 @@ pub fn execute_kubectl_command(input: &str, state: &mut ShellState) -> Result<()
     }
 
     if args[0] == "restart-reason" {
-        return execute_restart_reason_command(&args);
+        return execute_restart_reason_command(&args, state);
     }
 
     if args[0] == "tail" {
         return execute_tail_command(&args, state);
     }
 
+    if args[0] == "jobs" {
+        state.job_manager.list();
+        return Ok(());
+    }
+
+    if args[0] == "fg" {
+        if args.len() < 2 {
+            return Err("Usage: fg <job-id>".to_string());
+        }
+        let id = args[1]
+            .parse::<usize>()
+            .map_err(|_| format!("'{}' is not a valid job id", args[1]))?;
+        return state.job_manager.foreground(id);
+    }
+
+    if args[0] == "job" {
+        if args.len() < 2 {
+            return Err("Usage: job kill <id> | job clean".to_string());
+        }
+        match args[1].as_str() {
+            "kill" => {
+                if args.len() < 3 {
+                    return Err("Usage: job kill <id>".to_string());
+                }
+                let id = args[2]
+                    .parse::<usize>()
+                    .map_err(|_| format!("'{}' is not a valid job id", args[2]))?;
+                return state.job_manager.kill_job(id);
+            }
+            "clean" => {
+                state.job_manager.clean();
+                return Ok(());
+            }
+            other => return Err(format!("Unknown job sub-command '{}'. Try: kill, clean", other)),
+        }
+    }
+
+    if args[0] == "ask" {
+        if args.len() < 2 {
+            return Err("Usage: ask <question>".to_string());
+        }
+        let question = args[1..].join(" ");
+        let context = current_context();
+        let namespace = effective_namespace(state);
+        match state.ai_client.ask(&question, &context, &namespace) {
+            Ok(response) => println!("{response}"),
+            Err(e) => return Err(e),
+        }
+        return Ok(());
+    }
+
+    if args[0] == "ai" {
+        match args.get(1).map(String::as_str) {
+            Some("status") => return state.ai_client.status(),
+            Some("model") => {
+                if args.len() < 3 {
+                    return Err("Usage: ai model <name>".to_string());
+                }
+                state.ai_client.model = args[2].clone();
+                println!("AI model set to '{}'", args[2]);
+                return Ok(());
+            }
+            Some("explain") => {
+                if args.len() < 3 {
+                    return Err("Usage: ai explain <kubectl args...>".to_string());
+                }
+                let context = current_context();
+                let namespace = effective_namespace(state);
+                let mut kubectl_args = args[2..].to_vec();
+                apply_default_namespace(&mut kubectl_args, state);
+                let command_hint = format!("kubectl {}", kubectl_args.join(" "));
+                let mut kubectl_stage = vec!["kubectl".to_string()];
+                kubectl_stage.extend(kubectl_args);
+                let output = run_pipeline_capture(&[kubectl_stage], state.show_commands)?;
+                match state.ai_client.explain(
+                    &output,
+                    Some(&command_hint),
+                    &context,
+                    &namespace,
+                ) {
+                    Ok(response) => println!("{response}"),
+                    Err(e) => return Err(e),
+                }
+                return Ok(());
+            }
+            _ => return Err("Usage: ai status | ai model <name> | ai explain <args...>".to_string()),
+        }
+    }
+
     if args.iter().any(|arg| arg == "|") {
-        let mut stages = split_pipeline(&args)?;
+        let stages = split_pipeline(&args)?;
+
+        // Intercept `| explain` — last stage is "explain" (AI)
+        if stages.last().map(|s| s.as_slice()) == Some(&["explain".to_string()]) {
+            let preceding = &stages[..stages.len() - 1];
+            let mut kubectl_args = preceding[0].clone();
+
+            let context = current_context();
+            if state.risky_contexts.contains(&context)
+                && should_confirm_in_risky_context(&kubectl_args)
+                && !kubectl_args.iter().any(|arg| arg == "--yes")
+                && !confirm_risky_context(&kubectl_args, &context)?
+            {
+                println!("Command cancelled.");
+                return Ok(());
+            }
+
+            apply_output_profile(&mut kubectl_args, state.output_profile);
+            apply_dry_run(&mut kubectl_args, state.dry_run);
+            apply_default_namespace(&mut kubectl_args, state);
+
+            let mut pipeline: Vec<Vec<String>> = Vec::with_capacity(preceding.len());
+            let mut first_stage = vec!["kubectl".to_string()];
+            first_stage.extend(kubectl_args);
+            pipeline.push(first_stage);
+            for stage in preceding[1..].iter() {
+                pipeline.push(stage.clone());
+            }
+
+            let context = current_context();
+            let namespace = effective_namespace(state);
+            let command_hint = pipeline
+                .iter()
+                .map(|stage| stage.join(" "))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let output = run_pipeline_capture(&pipeline, state.show_commands)?;
+            return state
+                .ai_client
+                .explain(&output, Some(&command_hint), &context, &namespace)
+                .map(|response| println!("{response}"));
+        }
+
+        let mut stages = stages;
         let mut kubectl_args = stages.remove(0);
 
         let context = current_context();
@@ -1767,6 +2081,7 @@ pub fn execute_kubectl_command(input: &str, state: &mut ShellState) -> Result<()
 
         apply_output_profile(&mut kubectl_args, state.output_profile);
         apply_dry_run(&mut kubectl_args, state.dry_run);
+        apply_default_namespace(&mut kubectl_args, state);
 
         if state.safe_delete
             && kubectl_args.first().map(String::as_str) == Some("delete")
@@ -1790,7 +2105,7 @@ pub fn execute_kubectl_command(input: &str, state: &mut ShellState) -> Result<()
         if logs_has_time_range(&args) && logs_has_follow(&args) {
             return Err("logs time ranges cannot be used with -f/--follow".to_string());
         }
-        return crate::multi_logs::execute_multi_logs_command(&args, state.show_commands, current_namespace());
+        return crate::multi_logs::execute_multi_logs_command(&args, state.show_commands, effective_namespace(state));
     }
 
     if args[0] == "logs" {
@@ -1809,7 +2124,7 @@ pub fn execute_kubectl_command(input: &str, state: &mut ShellState) -> Result<()
 
         let target = args[target_idx].clone();
         if !target.contains('/') {
-            let namespace = explicit_namespace_from_args(&args).unwrap_or_else(current_namespace);
+            let namespace = explicit_namespace_from_args(&args).unwrap_or_else(|| effective_namespace(state));
             let matches = matching_pods_for_input(&namespace, &target)?;
 
             if matches.len() == 1 {
@@ -1852,6 +2167,7 @@ pub fn execute_kubectl_command(input: &str, state: &mut ShellState) -> Result<()
 
     apply_output_profile(&mut args, state.output_profile);
     apply_dry_run(&mut args, state.dry_run);
+    apply_default_namespace(&mut args, state);
 
     if state.safe_delete
         && args.first().map(String::as_str) == Some("delete")
@@ -1863,7 +2179,14 @@ pub fn execute_kubectl_command(input: &str, state: &mut ShellState) -> Result<()
     }
 
     if args.first().map(String::as_str) == Some("port-forward") {
+        if run_bg {
+            return state.job_manager.spawn(&args, state.show_commands).map(|_| ());
+        }
         return execute_port_forward_with_optional_browse(&args, state.show_commands);
+    }
+
+    if run_bg {
+        return state.job_manager.spawn(&args, state.show_commands).map(|_| ());
     }
 
     run_kubectl_args(&args, state.show_commands)

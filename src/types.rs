@@ -3,6 +3,9 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Instant;
 
+use crate::jobs::JobManager;
+use crate::ai::AiClient;
+
 use rustyline::validate::Validator;
 use rustyline::highlight::Highlighter;
 use rustyline::hint::{Hinter, HistoryHinter};
@@ -56,12 +59,16 @@ pub struct ShellState {
     pub output_profile: OutputProfile,
     pub dry_run: bool,
     pub show_commands: bool,
+    pub session_namespace_mode: bool,
+    pub session_namespace: Option<String>,
     pub safe_delete: bool,
     pub risky_contexts: HashSet<String>,
     pub previous_context: Option<String>,
     pub previous_namespace: Option<String>,
     pub prompt_template: String,
     pub state_file: PathBuf,
+    pub job_manager: JobManager,
+    pub ai_client: AiClient,
 }
 
 /// Cache for completion data with TTL
@@ -132,7 +139,36 @@ impl Hinter for KubeShellHelper {
     type Hint = String;
 
     fn hint(&self, line: &str, pos: usize, ctx: &Context<'_>) -> Option<Self::Hint> {
-        self.hinter.hint(line, pos, ctx)
+        if let Some(history_hint) = self.hinter.hint(line, pos, ctx) {
+            return Some(history_hint);
+        }
+
+        if pos != line.len() {
+            return None;
+        }
+
+        let start = crate::completion::completion_start(line, pos);
+        let current_token = &line[start..pos];
+        let previous_tokens: Vec<&str> = line[..start].split_whitespace().collect();
+
+        let mut options = crate::completion::command_candidates_with_live(self, &previous_tokens, current_token);
+        options.sort();
+        options.dedup();
+
+        let mut matches: Vec<String> = options
+            .into_iter()
+            .filter(|option| option.starts_with(current_token) && option.len() > current_token.len())
+            .collect();
+
+        matches.sort();
+        matches.dedup();
+
+        if matches.len() == 1 {
+            let completion = &matches[0][current_token.len()..];
+            return Some(completion.to_string());
+        }
+
+        None
     }
 }
 
