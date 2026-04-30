@@ -177,13 +177,15 @@ pub fn confirm_delete(args: &[String]) -> Result<bool, String> {
 
 /// Switch to a context with history
 pub fn switch_context_with_history(target: &str, state: &mut ShellState) -> Result<(), String> {
-    let current = current_context();
+    let current = state.current_context.clone();
     if current == target {
         return Ok(());
     }
 
     set_context(target, state.show_commands)?;
     state.previous_context = Some(current);
+    state.current_context = target.to_string();
+    state.current_namespace = current_namespace();
     Ok(())
 }
 
@@ -198,9 +200,15 @@ pub fn switch_namespace_with_history(target: &str, state: &mut ShellState) -> Re
         state.session_namespace = Some(target.to_string());
     } else {
         set_namespace(target, state.show_commands)?;
+        state.current_namespace = target.to_string();
     }
     state.previous_namespace = Some(current);
     Ok(())
+}
+
+/// Resolve the context this shell should use for commands and prompt.
+pub fn effective_context(state: &ShellState) -> String {
+    state.current_context.clone()
 }
 
 /// Resolve the namespace this shell should use for commands and prompt.
@@ -209,9 +217,9 @@ pub fn effective_namespace(state: &ShellState) -> String {
         state
             .session_namespace
             .clone()
-            .unwrap_or_else(current_namespace)
+            .unwrap_or_else(|| state.current_namespace.clone())
     } else {
-        current_namespace()
+        state.current_namespace.clone()
     }
 }
 
@@ -1975,7 +1983,7 @@ pub fn execute_kubectl_command(input: &str, state: &mut ShellState) -> Result<()
             return Err("Usage: ask <question>".to_string());
         }
         let question = args[1..].join(" ");
-        let context = current_context();
+        let context = effective_context(state);
         let namespace = effective_namespace(state);
         match state.ai_client.ask(&question, &context, &namespace) {
             Ok(response) => println!("{response}"),
@@ -1999,7 +2007,7 @@ pub fn execute_kubectl_command(input: &str, state: &mut ShellState) -> Result<()
                 if args.len() < 3 {
                     return Err("Usage: ai explain <kubectl args...>".to_string());
                 }
-                let context = current_context();
+                let context = effective_context(state);
                 let namespace = effective_namespace(state);
                 let mut kubectl_args = args[2..].to_vec();
                 apply_default_namespace(&mut kubectl_args, state);
@@ -2030,7 +2038,7 @@ pub fn execute_kubectl_command(input: &str, state: &mut ShellState) -> Result<()
             let preceding = &stages[..stages.len() - 1];
             let mut kubectl_args = preceding[0].clone();
 
-            let context = current_context();
+            let context = effective_context(state);
             if state.risky_contexts.contains(&context)
                 && should_confirm_in_risky_context(&kubectl_args)
                 && !kubectl_args.iter().any(|arg| arg == "--yes")
@@ -2052,7 +2060,7 @@ pub fn execute_kubectl_command(input: &str, state: &mut ShellState) -> Result<()
                 pipeline.push(stage.clone());
             }
 
-            let context = current_context();
+            let context = effective_context(state);
             let namespace = effective_namespace(state);
             let command_hint = pipeline
                 .iter()
@@ -2069,7 +2077,7 @@ pub fn execute_kubectl_command(input: &str, state: &mut ShellState) -> Result<()
         let mut stages = stages;
         let mut kubectl_args = stages.remove(0);
 
-        let context = current_context();
+        let context = effective_context(state);
         if state.risky_contexts.contains(&context)
             && should_confirm_in_risky_context(&kubectl_args)
             && !kubectl_args.iter().any(|arg| arg == "--yes")
@@ -2155,7 +2163,7 @@ pub fn execute_kubectl_command(input: &str, state: &mut ShellState) -> Result<()
     }
 
     // Handle kubectl commands
-    let context = current_context();
+    let context = effective_context(state);
     if state.risky_contexts.contains(&context)
         && should_confirm_in_risky_context(&args)
         && !args.iter().any(|arg| arg == "--yes")

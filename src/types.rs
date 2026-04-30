@@ -56,6 +56,8 @@ impl OutputProfile {
 pub struct ShellState {
     pub aliases: HashMap<String, String>,
     pub aliases_file: PathBuf,
+    pub current_context: String,
+    pub current_namespace: String,
     pub output_profile: OutputProfile,
     pub dry_run: bool,
     pub show_commands: bool,

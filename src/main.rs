@@ -15,7 +15,6 @@ use rustyline::{Config, Editor};
 
 use types::{KubeShellHelper, ShellState, OutputProfile};
 use jobs::JobManager;
-use kubectl::current_context;
 use config::*;
 use commands::execute_kubectl_command;
 
@@ -50,15 +49,20 @@ fn main() {
     let (saved_profile, saved_dry_run, saved_show_commands, saved_prev_ctx, saved_prev_ns) =
         load_shell_state(&state_path);
 
+    let current_context = kubectl::current_context();
+    let current_namespace = kubectl::current_namespace();
+
     let mut shell_state = ShellState {
         aliases,
         aliases_file: aliases_path,
+        current_context,
+        current_namespace: current_namespace.clone(),
         output_profile: saved_profile.unwrap_or(OutputProfile::Default),
         dry_run: saved_dry_run.unwrap_or(dry_run),
         show_commands: saved_show_commands.unwrap_or(show_commands),
         session_namespace_mode,
         session_namespace: if session_namespace_mode {
-            Some(kubectl::current_namespace())
+            Some(current_namespace)
         } else {
             None
         },
@@ -115,7 +119,7 @@ fn main() {
             helper.set_alias_names(shell_state.aliases.keys().cloned().collect());
         }
 
-        let cluster = current_context();
+        let cluster = commands::effective_context(&shell_state);
         let namespace = commands::effective_namespace(&shell_state);
         let risk_marker = if shell_state.risky_contexts.contains(&cluster) {
             "[RISK] "
